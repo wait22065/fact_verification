@@ -11,10 +11,12 @@
 
 ## 功能特点
 
-- 使用FEVER公开数据集（验证集）
+- 使用FEVER公开数据集（labelled_dev验证集，37566条）
 - 调用DeepSeek API进行事实验证
 - 支持随机采样和可复现实验
+- 首次运行自动下载并缓存数据集到本地，后续直接读取
 - 完整的评估指标（accuracy、precision、recall、F1、幻觉率）
+- 自动记录无法解析的模型响应，方便调整prompt
 - 详细的日志记录和结果保存
 
 ## 安装
@@ -26,8 +28,30 @@ git clone <your-repo-url>
 cd fact_verification
 ```
 
-### 2. 安装依赖
+### 2. 创建虚拟环境（推荐使用uv）
+
 ```bash
+# 安装uv（如果还没安装）
+pip install uv
+
+# 创建虚拟环境
+uv venv
+
+# 激活虚拟环境
+# Windows:
+.venv\Scripts\activate
+
+# Linux/Mac:
+source .venv/bin/activate
+```
+
+### 3. 安装依赖
+
+```bash
+# 使用uv安装（速度更快）
+uv pip install -r requirements.txt
+
+# 或使用pip
 pip install -r requirements.txt
 ```
 
@@ -39,7 +63,7 @@ pip install -r requirements.txt
 - `tqdm` - 进度条显示
 - `datasets` - Hugging Face数据集加载
 
-### 3. 配置API密钥
+### 4. 配置API密钥
 
 复制环境变量模板：
 
@@ -63,11 +87,13 @@ python main.py
 
 程序会自动：
 
-1. 从Hugging Face加载FEVER验证集
-2. 随机采样50条数据（可在`src/config.py`中配置）
-3. 调用DeepSeek API进行验证
-4. 计算评估指标
-5. 保存结果到`data/results/verification_results.json`
+1. **首次运行**：从Hugging Face下载FEVER验证集并保存到 `data/fever_labelled_dev.json`
+2. **后续运行**：直接从本地JSON文件加载（速度快）
+3. 随机采样50条数据（可在`src/config.py`中配置）
+4. 调用DeepSeek API进行验证
+5. 计算评估指标
+6. 保存结果到`data/results/verification_results.json`
+7. 如有解析错误，保存到`data/results/parse_errors.json`
 
 ### 配置参数
 
@@ -75,7 +101,7 @@ python main.py
 
 ```python
 SAMPLE_SIZE = 50        # 采样数量
-RANDOM_SEED = 42        # 随机种子
+RANDOM_SEED = 42        # 随机种子（固定后每次采样结果相同）
 TEMPERATURE = 0.1       # 模型温度
 MAX_RETRIES = 3         # API重试次数
 ```
@@ -85,18 +111,26 @@ MAX_RETRIES = 3         # API重试次数
 ### 控制台输出
 
 ```
-=== FEVER事实验证系统 - 任务一：Baseline（无证据） ===
+============================================================
+FEVER事实验证系统 - 任务一：Baseline（无证据）
+============================================================
 
-正在加载FEVER数据集 (validation)...
-数据集总数: 19998条
-随机采样: 50条
+2026-04-17 15:05:54 - FEVER_Verification - INFO - 步骤1: 加载FEVER数据集
+
+首次运行，从Hugging Face下载FEVER数据集 (labelled_dev)...
+数据集总数: 37566条
+数据验证完成: 37566条有效数据
+保存数据集到本地: data/fever_labelled_dev.json
+保存完成！
+随机采样: 50条 (随机种子: 42)
 
 标签分布:
-  SUPPORTS: 20条
-  REFUTES: 15条
-  NOT ENOUGH INFO: 15条
+  REFUTES: 13条
+  SUPPORTS: 23条
+  NOT ENOUGH INFO: 14条
 
-验证进度: 100%|██████████| 50/50 [00:45<00:00]
+2026-04-17 15:05:59 - FEVER_Verification - INFO - 步骤2: 执行事实验证
+验证进度: 100%|██████████| 50/50 [00:45<00:00,  1.11it/s]
 
 ==================================================
 评估结果
@@ -113,16 +147,23 @@ Hallucination Rate (幻觉率): 0.1500
 ==================================================
 类别                 Precision    Recall       F1-Score     Support
 ----------------------------------------------------------------------
-SUPPORTS             0.8500       0.8800       0.8650       20
-REFUTES              0.8000       0.7500       0.7750       15
-NOT ENOUGH INFO      0.7300       0.7300       0.7300       15
+SUPPORTS             0.8500       0.8800       0.8650       23
+REFUTES              0.8000       0.7500       0.7750       13
+NOT ENOUGH INFO      0.7300       0.7300       0.7300       14
 
+已保存 2 条解析错误到: data/results/parse_errors.json
 结果已保存到: data/results/verification_results.json
+
+============================================================
+任务完成！
+总耗时: 45.3秒
+结果文件: data/results/verification_results.json
+============================================================
 ```
 
 ### 结果文件
 
-`data/results/verification_results.json` 包含：
+**`data/results/verification_results.json`** - 完整验证结果：
 
 ```json
 {
@@ -153,30 +194,49 @@ NOT ENOUGH INFO      0.7300       0.7300       0.7300       15
 }
 ```
 
+**`data/results/parse_errors.json`** - 解析错误记录（如果有）：
+
+```json
+[
+  {
+    "timestamp": "2026-04-17T15:06:23.123456",
+    "claim_id": 12345,
+    "claim": "某个声明...",
+    "response": "模型的原始响应...",
+    "reason": "无法匹配任何标签"
+  }
+]
+```
+
 ## 项目结构
 
 ```
 fact_verification/
-├── src/
+├── .venv/                      # 虚拟环境（不提交）
+├── .git/                       # Git仓库
+├── src/                        # 源代码
 │   ├── __init__.py
-│   ├── config.py           # 配置管理
-│   ├── data_loader.py      # 数据加载
-│   ├── api_client.py       # API调用
-│   ├── prompt_builder.py   # Prompt构造
-│   ├── verifier.py         # 验证逻辑
-│   ├── evaluator.py        # 评估指标
-│   └── utils.py            # 工具函数
+│   ├── config.py               # 配置管理
+│   ├── data_loader.py          # 数据加载（支持本地缓存）
+│   ├── api_client.py           # API调用（含重试机制）
+│   ├── prompt_builder.py       # Prompt构造（含错误记录）
+│   ├── verifier.py             # 验证逻辑
+│   ├── evaluator.py            # 评估指标计算
+│   └── utils.py                # 工具函数
 ├── data/
-│   ├── cache/              # 数据缓存
-│   └── results/            # 结果输出
+│   ├── fever_labelled_dev.json # FEVER数据集本地缓存（不提交）
+│   └── results/                # 结果输出（不提交）
+│       ├── verification_results.json
+│       └── parse_errors.json
 ├── logs/
-│   └── verification.log    # 运行日志
-├── main.py                 # 主程序
-├── requirements.txt        # 依赖包
-├── .env.example            # 环境变量模板
-├── .gitignore
-├── README.md
-└── METRICS.md              # 评估指标说明
+│   └── verification.log        # 运行日志
+├── main.py                     # 主程序入口
+├── requirements.txt            # 依赖包
+├── .env                        # 环境变量（不提交）
+├── .env.example                # 环境变量模板
+├── .gitignore                  # Git忽略规则
+├── README.md                   # 项目文档
+└── METRICS.md                  # 评估指标详细说明
 ```
 
 ## 评估指标说明
@@ -192,9 +252,11 @@ fact_verification/
 ## 注意事项
 
 1. **API密钥安全** - 不要将`.env`文件提交到Git
-2. **速率限制** - 程序已添加请求延迟，避免触发API限制
-3. **数据下载** - 首次运行会从Hugging Face下载FEVER数据集（约500MB）
-4. **任务说明** - 任务一不使用evidence，测试模型的内在知识
+2. **速率限制** - 程序已添加请求延迟（0.5秒），避免触发API限制
+3. **数据缓存** - 首次运行会下载约40MB数据，保存到本地后续直接读取
+4. **随机种子** - 固定随机种子后，每次采样结果完全一致，保证可复现
+5. **任务说明** - 任务一不使用evidence，测试模型的内在知识
+6. **错误记录** - 无法解析的响应会自动记录，方便调整prompt
 
 ## 任务对比
 
@@ -203,6 +265,7 @@ fact_verification/
 | 输入       | 只有claim          | claim + evidence |
 | 目的       | 测试模型内在知识   | 测试检索增强效果 |
 | 预期准确率 | 较低               | 较高             |
+| 幻觉率     | 可能较高           | 应该降低         |
 
 ## 常见问题
 
@@ -214,13 +277,21 @@ fact_verification/
 
 编辑 `src/config.py`，修改 `MODEL_NAME` 参数。
 
+### Q: 如何重新下载数据集？
+
+删除 `data/fever_labelled_dev.json` 文件，再次运行程序即可。
+
 ### Q: API调用失败怎么办？
 
 检查：
 
-1. API密钥是否正确
+1. API密钥是否正确（查看`.env`文件）
 2. 网络连接是否正常
 3. 查看 `logs/verification.log` 了解详细错误
+
+### Q: 如何查看无法解析的响应？
+
+查看 `data/results/parse_errors.json` 文件，根据实际响应调整 `src/prompt_builder.py` 中的解析逻辑。
 
 ### Q: 如何推送到GitHub？
 
@@ -235,12 +306,9 @@ git push -u origin main
 
 MIT License
 
-## 作者
-
-[Your Name]
-
 ## 致谢
 
 - [FEVER数据集](https://fever.ai/)
 - [Hugging Face Datasets](https://huggingface.co/datasets/fever/fever)
 - [DeepSeek API](https://www.deepseek.com/)
+- [uv - 快速Python包管理器](https://github.com/astral-sh/uv)
