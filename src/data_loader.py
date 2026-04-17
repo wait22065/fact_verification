@@ -37,7 +37,8 @@ def load_fever_data(split=FEVER_SPLIT, sample_size=SAMPLE_SIZE, seed=RANDOM_SEED
         print(f"首次运行，从Hugging Face下载FEVER数据集 ({split})...")
 
         # 从Hugging Face加载FEVER数据集
-        dataset = load_dataset("fever", "v1.0", split=split)
+        # 使用新的数据集路径格式
+        dataset = load_dataset("fever", "v1.0", split=split, trust_remote_code=True)
 
         print(f"数据集总数: {len(dataset)}条")
 
