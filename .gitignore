@@ -53,4 +53,7 @@ Thumbs.db
 .huggingface/
 
 # 结果文件（可选择性提交）
-# data/results/
+data/results/
+
+# Claude相关
+.claude/
