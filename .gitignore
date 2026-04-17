@@ -36,6 +36,9 @@ logs/
 data/cache/
 .cache/
 
+# FEVER数据集本地缓存（文件较大，不提交）
+data/fever_*.json
+
 # IDE
 .vscode/
 .idea/

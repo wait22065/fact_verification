@@ -4,7 +4,12 @@ FEVER事实验证系统 - 验证核心逻辑模块
 import time
 from tqdm import tqdm
 from src.api_client import create_client
-from src.prompt_builder import build_verification_prompt, parse_model_response
+from src.prompt_builder import (
+    build_verification_prompt,
+    parse_model_response,
+    save_parse_errors,
+    clear_parse_errors
+)
 from src.utils import save_json
 from src.config import RESULTS_FILE
 
@@ -35,6 +40,9 @@ class FactVerifier:
         """
         self.logger.info(f"开始验证 {len(data_list)} 条数据...")
 
+        # 清空之前的解析错误记录
+        clear_parse_errors()
+
         y_true = []  # 真实标签
         y_pred = []  # 预测标签
         detailed_results = []  # 详细结果
@@ -46,7 +54,7 @@ class FactVerifier:
             true_label = item['label']
 
             # 验证单条claim
-            prediction = self._verify_single_claim(claim)
+            prediction = self._verify_single_claim(claim, claim_id)
 
             # 记录结果
             result = {
@@ -71,18 +79,22 @@ class FactVerifier:
 
         self.logger.info(f"验证完成！成功: {len(y_pred)}/{len(data_list)}")
 
+        # 保存解析错误日志
+        save_parse_errors()
+
         return {
             'y_true': y_true,
             'y_pred': y_pred,
             'detailed_results': detailed_results
         }
 
-    def _verify_single_claim(self, claim):
+    def _verify_single_claim(self, claim, claim_id=None):
         """
         验证单条claim
 
         Args:
             claim: 待验证的声明
+            claim_id: claim的ID（用于错误记录）
 
         Returns:
             str: 预测的标签，失败返回None
@@ -96,11 +108,11 @@ class FactVerifier:
         if not response:
             return None
 
-        # 解析响应
-        prediction = parse_model_response(response)
+        # 解析响应（传入claim_id和claim用于错误记录）
+        prediction = parse_model_response(response, claim_id=claim_id, claim=claim)
 
         if not prediction:
-            self.logger.warning(f"无法解析模型响应: {response}")
+            self.logger.warning(f"无法解析模型响应 (ID: {claim_id})")
 
         return prediction
 

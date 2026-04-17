@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:fever.ai)"
+      "WebFetch(domain:fever.ai)",
+      "Bash(git add:*)"
     ]
   }
 }

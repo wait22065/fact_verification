@@ -3,12 +3,18 @@ FEVER事实验证系统 - 数据加载模块
 """
 from datasets import load_dataset
 import random
+import os
+import json
+from pathlib import Path
 from src.config import FEVER_SPLIT, SAMPLE_SIZE, RANDOM_SEED, VALID_LABELS
 
 
 def load_fever_data(split=FEVER_SPLIT, sample_size=SAMPLE_SIZE, seed=RANDOM_SEED):
     """
     加载FEVER数据集并随机采样
+
+    首次运行时从Hugging Face下载并保存到本地
+    后续运行直接从本地JSON文件加载
 
     Args:
         split: 数据集分割（train/validation/test）
@@ -18,31 +24,48 @@ def load_fever_data(split=FEVER_SPLIT, sample_size=SAMPLE_SIZE, seed=RANDOM_SEED
     Returns:
         list: 采样后的数据列表，每个元素包含 {'id', 'claim', 'label'}
     """
-    print(f"正在加载FEVER数据集 ({split})...")
+    # 本地缓存文件路径
+    cache_file = f"data/fever_{split}.json"
 
-    # 从Hugging Face加载FEVER数据集
-    dataset = load_dataset("fever", "v1.0", split=split)
+    # 检查本地缓存是否存在
+    if os.path.exists(cache_file):
+        print(f"从本地加载FEVER数据集: {cache_file}")
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            data_list = json.load(f)
+        print(f"数据集总数: {len(data_list)}条")
+    else:
+        print(f"首次运行，从Hugging Face下载FEVER数据集 ({split})...")
 
-    print(f"数据集总数: {len(dataset)}条")
+        # 从Hugging Face加载FEVER数据集
+        dataset = load_dataset("fever", "v1.0", split=split)
 
-    # 转换为列表格式
-    data_list = []
-    for item in dataset:
-        # 只提取claim和label，不使用evidence（任务一）
-        data_list.append({
-            'id': item['id'],
-            'claim': item['claim'],
-            'label': item['label']
-        })
+        print(f"数据集总数: {len(dataset)}条")
 
-    # 验证数据
-    data_list = validate_data(data_list)
+        # 转换为列表格式
+        data_list = []
+        for item in dataset:
+            # 只提取claim和label，不使用evidence（任务一）
+            data_list.append({
+                'id': item['id'],
+                'claim': item['claim'],
+                'label': item['label']
+            })
+
+        # 验证数据
+        data_list = validate_data(data_list)
+
+        # 保存到本地
+        print(f"保存数据集到本地: {cache_file}")
+        Path(cache_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(data_list, f, ensure_ascii=False, indent=2)
+        print("保存完成！")
 
     # 随机采样
     random.seed(seed)
     if sample_size < len(data_list):
         sampled_data = random.sample(data_list, sample_size)
-        print(f"随机采样: {sample_size}条")
+        print(f"随机采样: {sample_size}条 (随机种子: {seed})")
     else:
         sampled_data = data_list
         print(f"使用全部数据: {len(sampled_data)}条")
