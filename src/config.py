@@ -25,7 +25,7 @@ BACKOFF_FACTOR = 2  # 指数退避因子
 # 数据配置
 SAMPLE_SIZE = 50  # 每次采样的数据量
 RANDOM_SEED = 42  # 保证可复现
-FEVER_SPLIT = "validation"  # 使用验证集
+FEVER_SPLIT = "labelled_dev"  # 使用带标签的验证集
 
 # 标签映射
 LABEL_MAPPING = {
