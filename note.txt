@@ -1,1 +1,3 @@
 1.uv venv 创建虚拟环境 .venv\Scripts\activate 激活虚拟环境
+2.运行测试 python main.py
+3.FEVER数据集的验证集标签为labelled_dev，进行基线测试时，不需要使用evidence条目
