@@ -12,12 +12,13 @@ load_dotenv()
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DATA_CACHE_DIR = os.path.join(BASE_DIR, "data", "cache")
-RESULTS_DIR    = os.path.join(BASE_DIR, "data", "results")
+RESULTS_DIR    = os.path.join(BASE_DIR, "results")
 LOG_DIR        = os.path.join(BASE_DIR, "logs")
 
-LOG_FILE       = os.path.join(LOG_DIR,     "verification.log")
-RESULTS_FILE   = os.path.join(RESULTS_DIR, "verification_results.json")
 PARSE_ERROR_LOG = os.path.join(RESULTS_DIR, "parse_errors.json")
+
+# 具体的 LOG_FILE / RESULTS_FILE 不在这里定义：
+# main.py 会在运行时根据 EXPERIMENT_MODE + 时间戳动态生成文件名
 
 # 确保目录存在
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
@@ -29,13 +30,13 @@ DEEPSEEK_API_KEY  = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 MODEL_NAME        = "deepseek-chat"
 
-TEMPERATURE    = 0.1   # 模型输出随机性，越低越确定
-MAX_TOKENS     = 1024  # 最大输出 token 数
-TIMEOUT        = 60    # 单次请求超时时间（秒）
-MAX_RETRIES    = 3     # API 失败最大重试次数
-RETRY_DELAY    = 2     # 初始重试等待时间（秒）
-RETRY_DELAY_MAX = 10   # 最大重试等待时间（秒）
-BACKOFF_FACTOR = 2     # 指数退避倍率（每次重试等待时间 × 该值）
+TEMPERATURE     = 0.1   # 模型输出随机性，越低越确定
+MAX_TOKENS      = 1024  # 最大输出 token 数
+TIMEOUT         = 60    # 单次请求超时时间（秒）
+MAX_RETRIES     = 3     # API 失败最大重试次数
+RETRY_DELAY     = 2     # 初始重试等待时间（秒）
+RETRY_DELAY_MAX = 10    # 最大重试等待时间（秒）
+BACKOFF_FACTOR  = 2     # 指数退避倍率（每次重试等待时间 × 该值）
 
 # ================= 实验配置 =================
 # 可选值：BASELINE | COT | RAG | RAG_COT | RAG_BM25 | EXTENDED_PIPELINE
@@ -51,8 +52,7 @@ VALID_LABELS = ["SUPPORTS", "REFUTES", "NOT ENOUGH INFO"]
 # ================= BM25 本地检索配置（仅 RAG_BM25 模式使用）=================
 
 # Wikipedia dump 解压后的目录，存放 109 个 wiki-*.jsonl 文件
-# 约定放在项目根目录下的 data/wiki-pages/
-DUMP_DIR = os.path.join(BASE_DIR, "wiki-pages")
+DUMP_DIR  = os.path.join(BASE_DIR, "data", "wiki-pages")
 
 # BM25 索引持久化目录，存放 doc_ids.pkl / sentences.pkl / bm25.pkl 三个文件
 # 首次运行 build_bm25_index() 时自动创建，后续直接加载
