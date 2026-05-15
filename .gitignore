@@ -39,6 +39,9 @@ data/cache/
 # FEVER数据集本地缓存（文件较大，不提交）
 data/fever_*.json
 
+# wiki-pages缓存
+wiki-pages
+
 # IDE
 .vscode/
 .idea/
@@ -57,3 +60,9 @@ data/results/
 
 # Claude相关
 .claude/
+
+__MACOSX/
+
+note.txt
+
+config.py
