@@ -13,10 +13,6 @@ import random
 from pathlib import Path
 from datasets import load_dataset
 # 修改 src/data_loader.py
-import os
-import json
-import random
-from pathlib import Path
 
 def load_hover_data(sample_size=50, seed=42):
     """读取手动下载的 HoVer 官方 Dev 集文件"""
