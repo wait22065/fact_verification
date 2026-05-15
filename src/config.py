@@ -52,7 +52,7 @@ VALID_LABELS = ["SUPPORTS", "REFUTES", "NOT ENOUGH INFO"]
 # ================= BM25 本地检索配置（仅 RAG_BM25 模式使用）=================
 
 # Wikipedia dump 解压后的目录，存放 109 个 wiki-*.jsonl 文件
-DUMP_DIR  = os.path.join(BASE_DIR, "data", "wiki-pages")
+DUMP_DIR  = os.path.join(BASE_DIR, "wiki-pages")
 
 # BM25 索引持久化目录，存放 doc_ids.pkl / sentences.pkl / bm25.pkl 三个文件
 # 首次运行 build_bm25_index() 时自动创建，后续直接加载
