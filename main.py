@@ -86,7 +86,7 @@ def main():
         # ------------------------------------------------------------------
         if EXPERIMENT_MODE == "RAG_BM25":
             from src.config import INDEX_DIR, DUMP_DIR
-            from src.retriever import build_bm25_index
+            from src.retriever import build_bm25_index_filtered
 
             index_files = ["doc_ids.pkl", "sentences.pkl", "bm25.pkl"]
             index_missing = any(
@@ -101,7 +101,7 @@ def main():
                 print(f"  dump 目录：{DUMP_DIR}")
                 print(f"  索引目录：{INDEX_DIR}")
                 print("=" * 60)
-                build_bm25_index(dump_dir=DUMP_DIR, index_dir=INDEX_DIR)
+                build_bm25_index_filtered(dump_dir=DUMP_DIR, index_dir=INDEX_DIR)
                 logger.info("步骤1.5: BM25 索引构建完成")
             else:
                 logger.info(f"步骤1.5: BM25 索引已存在于 {INDEX_DIR}，跳过构建")
