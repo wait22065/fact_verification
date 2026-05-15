@@ -7,25 +7,26 @@ FEVER事实验证系统 - 证据检索模块
      - retrieve_evidence()           用于 RAG / RAG_COT 模式
      - retrieve_evidence_pipeline()  用于 EXTENDED_PIPELINE 模式
 
-  2. 新方案（本文件新增）：从本地 FEVER Wikipedia dump 检索
+  2. 新方案：从本地 FEVER Wikipedia dump 检索
      - build_bm25_index()            首次运行，构建并持久化 BM25 索引
      - load_bm25_index()             加载已有索引（进程内单例）
-     - retrieve_evidence_from_dump() 标准三阶段检索
+     - retrieve_evidence_from_dump() 标准两阶段检索
          阶段1：BM25 文档检索（从500万篇中召回 Top-N 篇文档）
          阶段2：Sentence-BERT 句子筛选（从召回文档中选 Top-K 句）
-         阶段3：返回证据文本供 LLM 判断
 
-dump 文件约定：
-  - 存放路径：wiki-pages/wiki-*.jsonl（109个文件）
-  - 每行格式：{"id": "Page_Title", "text": "...", "lines": "0\t句子0\n1\t句子1\n..."}
-  - id 字段与 FEVER evidence 里的 wiki_url 完全对应
-  - lines 字段的句子编号与 FEVER evidence 里的 sentence_id 对应
-  - -LRB- / -RRB- 是 dump 对括号的转义，读取时统一还原
+所有可调参数统一在 src/config.py 中设置：
+  DUMP_DIR              - wiki-*.jsonl 所在目录
+  INDEX_DIR             - 索引持久化目录
+  BM25_TOP_N_DOCS       - BM25 召回的候选文档数
+  SBERT_TOP_K_SENTENCES - 最终保留的证据句子数
+  MAX_SENTENCES_PER_DOC - 每篇文档最多进入候选池的句子数
+  SBERT_MODEL_NAME      - Sentence-BERT 模型名称
 
-索引持久化路径：data/bm25_index/
-  - doc_ids.pkl       所有文档 id 列表（顺序与 BM25 内部索引对齐）
-  - tokenized.pkl     分词后的语料（list of list of str）
-  - bm25.pkl          rank_bm25 的 BM25Okapi 对象
+dump 文件格式：
+  每行：{"id": "Page_Title", "text": "...", "lines": "0\t句子0\n1\t句子1\n..."}
+  - id     与 FEVER evidence 的 wiki_url 完全对应
+  - lines  的句子编号与 FEVER evidence 的 sentence_id 对应
+  - -LRB- / -RRB- 等是 dump 对括号的转义，读取时统一还原
 """
 
 import os
@@ -43,34 +44,31 @@ import torch
 from sentence_transformers import SentenceTransformer, util
 from rank_bm25 import BM25Okapi
 
+# 从 config 统一读取所有参数，retriever 本身不再定义任何魔法数字
+from src.config import (
+    DUMP_DIR,
+    INDEX_DIR,
+    BM25_TOP_N_DOCS,
+    SBERT_TOP_K_SENTENCES,
+    MAX_SENTENCES_PER_DOC,
+    SBERT_MODEL_NAME,
+)
+
 # ---------------------------------------------------------------------------
-# 全局配置
+# 代理 & Wikipedia 初始化
 # ---------------------------------------------------------------------------
 
 # ⚠️ 本地代理：部署到海外服务器时注释掉这两行
-os.environ['http_proxy'] = 'http://127.0.0.1:17890'
-os.environ['https_proxy'] = 'http://127.0.0.1:17890'
+os.environ['http_proxy']  = 'http://127.0.0.1:7890'
+os.environ['https_proxy'] = 'http://127.0.0.1:7890'
 
 wikipedia.set_lang("en")
 wikipedia.set_user_agent("FeverFactChecker/1.0 (Student_Project)")
 
-# dump 和索引的存放路径（相对于项目根目录）
-DUMP_DIR = "wiki-pages"
-INDEX_DIR = "data/bm25_index"
-
-# BM25 文档检索：每个 claim 召回的候选文档数
-BM25_TOP_N_DOCS = 5
-
-# Sentence-BERT 句子筛选：从候选文档中最终选出的句子数，可以试试3到5
-SBERT_TOP_K_SENTENCES = 5
-
-# 每篇文档最多读取的句子数（控制内存，超长文章截断）
-MAX_SENTENCES_PER_DOC = 50
-
 logger = logging.getLogger("FEVER_Retriever")
 
 # ---------------------------------------------------------------------------
-# NLTK 资源（分词用）
+# NLTK 资源（实时 API 方案分词用）
 # ---------------------------------------------------------------------------
 try:
     nltk.data.find('tokenizers/punkt')
@@ -88,34 +86,40 @@ except LookupError:
 _ST_MODEL: Optional[SentenceTransformer] = None
 
 def get_st_model() -> SentenceTransformer:
-    """懒加载 Sentence-BERT 模型，全进程只加载一次"""
+    """
+    懒加载 Sentence-BERT 模型，全进程只加载一次。
+    模型名称从 config.SBERT_MODEL_NAME 读取，方便切换。
+    """
     global _ST_MODEL
     if _ST_MODEL is None:
-        logger.info("正在加载 Sentence-BERT 模型 (all-MiniLM-L6-v2)...")
-        _ST_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+        logger.info(f"正在加载 Sentence-BERT 模型 ({SBERT_MODEL_NAME})...")
+        _ST_MODEL = SentenceTransformer(SBERT_MODEL_NAME)
         logger.info("Sentence-BERT 模型加载完成")
     return _ST_MODEL
 
 # ---------------------------------------------------------------------------
-# BM25 索引单例
+# BM25 相关单例（三个对象绑定在一起，由 load_bm25_index 统一写入）
 # ---------------------------------------------------------------------------
-_BM25_INDEX: Optional[BM25Okapi] = None
-_BM25_DOC_IDS: Optional[list] = None  # 与 BM25 内部顺序对齐的文档 id 列表
+_BM25_INDEX:      Optional[BM25Okapi] = None
+_BM25_DOC_IDS:    Optional[list]      = None
+_SENTENCES_STORE: Optional[dict]      = None  # {doc_id: {sent_id: text}}
+
+# ---------------------------------------------------------------------------
+# 内部工具函数
+# ---------------------------------------------------------------------------
 
 def _clean_text(text: str) -> str:
     """
     还原 FEVER dump 对特殊字符的转义：
-      -LRB-  ->  (
-      -RRB-  ->  )
-      -LSB-  ->  [
-      -RSB-  ->  ]
-      -LCB-  ->  {
-      -RCB-  ->  }
+      -LRB- / -RRB-  →  ( / )
+      -LSB- / -RSB-  →  [ / ]
+      -LCB- / -RCB-  →  { / }
     """
     text = text.replace("-LRB-", "(").replace("-RRB-", ")")
     text = text.replace("-LSB-", "[").replace("-RSB-", "]")
     text = text.replace("-LCB-", "{").replace("-RCB-", "}")
     return text.strip()
+
 
 def _parse_lines_field(lines_str: str) -> dict:
     """
@@ -125,6 +129,7 @@ def _parse_lines_field(lines_str: str) -> dict:
       "0\t句子0\n1\t句子1\n2\t"
 
     注意：
+      - split("\t", 1) 最多分割一次，防止句子本身含制表符被截断
       - 空句子（\t 后面没有内容）直接跳过
       - 句子编号从 0 开始，与 FEVER evidence 的 sentence_id 对应
     """
@@ -133,12 +138,12 @@ def _parse_lines_field(lines_str: str) -> dict:
         line = line.strip()
         if not line:
             continue
-        parts = line.split("\t", 1)  # 最多分割一次，防止句子本身含 \t
+        parts = line.split("\t", 1)
         if len(parts) < 2:
             continue
         sent_id_str, sent_text = parts
         sent_text = _clean_text(sent_text)
-        if not sent_text:  # 跳过空句子
+        if not sent_text:
             continue
         try:
             result[int(sent_id_str)] = sent_text
@@ -146,10 +151,13 @@ def _parse_lines_field(lines_str: str) -> dict:
             continue  # 编号不是数字则跳过（不应出现，保险起见）
     return result
 
+
 def _tokenize(text: str) -> list:
     """
     BM25 分词：转小写 + 按空白切分。
-    FEVER dump 已经是预处理过的纯文本，不需要复杂的分词器。
+
+    必须与建索引时保持完全一致，否则查询词和文档词表不匹配，召回率会极差。
+    FEVER dump 已经是预处理过的纯文本，空白切分已足够精确。
     """
     return text.lower().split()
 
@@ -157,32 +165,35 @@ def _tokenize(text: str) -> list:
 # 索引构建（首次运行，耗时较长）
 # ---------------------------------------------------------------------------
 
-def build_bm25_index(dump_dir: str = DUMP_DIR, index_dir: str = INDEX_DIR) -> None:
+def build_bm25_index(
+    dump_dir:  str = DUMP_DIR,
+    index_dir: str = INDEX_DIR,
+) -> None:
     """
     扫描全部 wiki-*.jsonl 文件，构建 BM25 索引并持久化到磁盘。
 
-    索引内容：
-      - doc_ids.pkl       文档 id 列表（顺序与 BM25 对齐）
-      - sentences.pkl     每篇文档的句子字典 {doc_id: {sent_id: text}}
-      - bm25.pkl          BM25Okapi 对象（用于文档级检索）
+    持久化三个文件：
+      doc_ids.pkl    - 文档 id 列表，顺序与 BM25 内部索引对齐
+      sentences.pkl  - {doc_id: {sent_id: text}}，供第二阶段句子筛选使用
+      bm25.pkl       - BM25Okapi 对象，供文档级检索使用
 
-    BM25 的"文档"定义：每篇 Wikipedia 文章的全文（text 字段），
-    用于文档级召回。句子级筛选在第二阶段由 Sentence-BERT 完成。
+    BM25 的"文档"单位是整篇 Wikipedia 文章（text 字段），
+    句子级筛选在第二阶段由 Sentence-BERT 完成。
 
     参数：
-      dump_dir:   wiki-*.jsonl 文件所在目录
-      index_dir:  索引保存目录
+      dump_dir:  wiki-*.jsonl 所在目录（默认读 config.DUMP_DIR）
+      index_dir: 索引保存目录（默认读 config.INDEX_DIR）
     """
     Path(index_dir).mkdir(parents=True, exist_ok=True)
 
-    doc_ids_path    = os.path.join(index_dir, "doc_ids.pkl")
-    sentences_path  = os.path.join(index_dir, "sentences.pkl")
-    bm25_path       = os.path.join(index_dir, "bm25.pkl")
+    doc_ids_path   = os.path.join(index_dir, "doc_ids.pkl")
+    sentences_path = os.path.join(index_dir, "sentences.pkl")
+    bm25_path      = os.path.join(index_dir, "bm25.pkl")
 
-    # 如果三个文件都已存在，直接跳过（不重复构建）
+    # 三个文件都存在则跳过（避免重复构建）
     if all(os.path.exists(p) for p in [doc_ids_path, sentences_path, bm25_path]):
         print(f"BM25 索引已存在于 {index_dir}，跳过构建。")
-        print("如需重建，请手动删除该目录再运行。")
+        print("如需重建，请手动删除该目录后再运行。")
         return
 
     jsonl_files = sorted(glob.glob(os.path.join(dump_dir, "wiki-*.jsonl")))
@@ -195,36 +206,35 @@ def build_bm25_index(dump_dir: str = DUMP_DIR, index_dir: str = INDEX_DIR) -> No
     print(f"找到 {len(jsonl_files)} 个 jsonl 文件，开始构建 BM25 索引...")
     print("预计耗时 5-15 分钟（取决于 CPU 性能），请耐心等待。")
 
-    doc_ids = []           # 文档 id 列表，与 tokenized_corpus 下标对齐
+    doc_ids          = []  # 与 tokenized_corpus 下标严格对齐
     tokenized_corpus = []  # BM25 语料：每篇文档的 token 列表
-    sentences_store = {}   # 句子存储：{doc_id: {sent_id: text}}
+    sentences_store  = {}  # {doc_id: {sent_id: text}}
 
     total_docs = 0
-    skipped = 0
+    skipped    = 0
 
     for file_idx, jsonl_path in enumerate(jsonl_files):
         file_name = os.path.basename(jsonl_path)
-        # 每处理10个文件打印一次进度
         if (file_idx + 1) % 10 == 0 or file_idx == 0:
             print(f"  处理中：{file_name} ({file_idx + 1}/{len(jsonl_files)})，"
                   f"已加载 {total_docs} 篇文档...")
 
         with open(jsonl_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+            for raw_line in f:
+                raw_line = raw_line.strip()
+                if not raw_line:
                     continue
                 try:
-                    record = json.loads(line)
+                    record = json.loads(raw_line)
                 except json.JSONDecodeError:
                     skipped += 1
                     continue
 
-                doc_id = record.get("id", "").strip()
-                text   = record.get("text", "").strip()
+                doc_id = record.get("id",    "").strip()
+                text   = record.get("text",  "").strip()
                 lines  = record.get("lines", "").strip()
 
-                # 跳过 id 或 text 为空的记录（dump 首行通常是空记录）
+                # dump 首行通常是空记录，跳过
                 if not doc_id or not text:
                     skipped += 1
                     continue
@@ -248,45 +258,44 @@ def build_bm25_index(dump_dir: str = DUMP_DIR, index_dir: str = INDEX_DIR) -> No
                 total_docs += 1
 
     print(f"文档加载完成：{total_docs} 篇有效文档，{skipped} 条记录跳过。")
-    print("正在构建 BM25 索引（rank_bm25）...")
+    print("正在构建 BM25Okapi 索引...")
 
-    # 构建 BM25 索引（BM25Okapi 是最常用的 BM25 变体，参数 k1=1.5, b=0.75）
+    # BM25Okapi 默认参数 k1=1.5, b=0.75，是学术界最常用的值
     bm25 = BM25Okapi(tokenized_corpus)
 
-    print("BM25 索引构建完成，正在持久化到磁盘...")
-
+    print("索引构建完成，正在持久化到磁盘...")
     with open(doc_ids_path, 'wb') as f:
         pickle.dump(doc_ids, f)
-    print(f"  已保存 doc_ids.pkl（{len(doc_ids)} 个 id）")
+    print(f"  doc_ids.pkl 已保存（{len(doc_ids)} 个 id）")
 
     with open(sentences_path, 'wb') as f:
         pickle.dump(sentences_store, f)
-    print(f"  已保存 sentences.pkl（{len(sentences_store)} 篇文档的句子）")
+    print(f"  sentences.pkl 已保存（{len(sentences_store)} 篇文档）")
 
     with open(bm25_path, 'wb') as f:
         pickle.dump(bm25, f)
-    print(f"  已保存 bm25.pkl")
+    print(f"  bm25.pkl 已保存")
 
     print(f"\nBM25 索引构建完成！文件存放于：{index_dir}")
 
 
+# ---------------------------------------------------------------------------
+# 索引加载（进程内单例，只加载一次）
+# ---------------------------------------------------------------------------
+
 def load_bm25_index(index_dir: str = INDEX_DIR):
     """
-    加载持久化的 BM25 索引到内存（全进程单例，只加载一次）。
+    加载持久化的 BM25 索引到内存。
+    全进程单例：第一次调用时从磁盘加载，后续调用直接返回缓存对象。
 
     返回：
       (bm25, doc_ids, sentences_store)
         bm25:            BM25Okapi 对象
-        doc_ids:         文档 id 列表
+        doc_ids:         文档 id 列表（顺序与 bm25 内部对齐）
         sentences_store: {doc_id: {sent_id: text}}
-
-    如果索引文件不存在，抛出 FileNotFoundError 并给出提示。
     """
-    global _BM25_INDEX, _BM25_DOC_IDS
-    # 注意：sentences_store 也需要单例，单独存一个模块级变量
-    global _SENTENCES_STORE
+    global _BM25_INDEX, _BM25_DOC_IDS, _SENTENCES_STORE
 
-    # 如果已经加载过，直接返回缓存
     if _BM25_INDEX is not None:
         return _BM25_INDEX, _BM25_DOC_IDS, _SENTENCES_STORE
 
@@ -310,7 +319,7 @@ def load_bm25_index(index_dir: str = INDEX_DIR):
 
     with open(sentences_path, 'rb') as f:
         _SENTENCES_STORE = pickle.load(f)
-    print(f"  sentences 加载完成")
+    print("  sentences 加载完成")
 
     with open(bm25_path, 'rb') as f:
         _BM25_INDEX = pickle.load(f)
@@ -319,125 +328,110 @@ def load_bm25_index(index_dir: str = INDEX_DIR):
     print("索引加载完毕，可以开始检索。")
     return _BM25_INDEX, _BM25_DOC_IDS, _SENTENCES_STORE
 
-# 模块级 sentences_store 单例（由 load_bm25_index 写入）
-_SENTENCES_STORE: Optional[dict] = None
 
 # ---------------------------------------------------------------------------
-# 新版三阶段检索主函数
+# 新版两阶段检索主函数
 # ---------------------------------------------------------------------------
 
 def retrieve_evidence_from_dump(
-    claim: str,
-    bm25_top_n: int = BM25_TOP_N_DOCS,
+    claim:       str,
+    bm25_top_n:  int = BM25_TOP_N_DOCS,
     sbert_top_k: int = SBERT_TOP_K_SENTENCES,
-    index_dir: str = INDEX_DIR,
+    index_dir:   str = INDEX_DIR,
 ) -> str:
     """
     从本地 FEVER Wikipedia dump 中检索与 claim 相关的证据。
 
-    实现标准三阶段流程：
+    两阶段流程：
       阶段1 - BM25 文档检索：
         对 claim 分词，用 BM25 从全量索引中召回 bm25_top_n 篇最相关文档。
-        BM25Okapi 的打分公式考虑词频、逆文档频率和文档长度归一化。
+        参数 bm25_top_n 默认读 config.BM25_TOP_N_DOCS。
 
       阶段2 - Sentence-BERT 句子筛选：
-        把召回文档的所有句子编码成向量，计算与 claim 向量的余弦相似度，
-        取 Top sbert_top_k 个句子作为最终证据。
-
-      阶段3 - 格式化输出：
-        返回带来源标注的证据字符串，供 prompt_builder 拼入 LLM prompt。
+        从召回文档中取所有句子（每篇最多 MAX_SENTENCES_PER_DOC 句），
+        编码成向量后与 claim 向量做余弦相似度排序，
+        返回 Top sbert_top_k 个句子作为最终证据。
+        参数 sbert_top_k 默认读 config.SBERT_TOP_K_SENTENCES。
 
     参数：
-      claim:       待验证的陈述文本
-      bm25_top_n:  BM25 召回的候选文档数（默认 5）
-      sbert_top_k: 最终保留的证据句子数（默认 5）
-      index_dir:   索引目录路径
+      claim:       待验证的陈述文本（直接传入，不需要预先提取关键词）
+      bm25_top_n:  覆盖 config 默认值的文档召回数
+      sbert_top_k: 覆盖 config 默认值的最终句子数
+      index_dir:   覆盖 config 默认值的索引目录
 
     返回：
-      证据字符串（多句用换行分隔），或以 "RETRIEVAL_ERROR:" 开头的错误信息
+      带来源标注的证据字符串，格式：
+        [1] (Page Title, 句#0) 句子文本...
+        [2] (Another Page, 句#3) 另一句文本...
+      或以 "RETRIEVAL_ERROR:" 开头的错误信息。
     """
     try:
-        # ----------------------------------------------------------------
-        # 加载索引（单例，第一次调用时加载，后续直接复用）
-        # ----------------------------------------------------------------
+        # 加载索引（单例，第一次调用时从磁盘加载）
         bm25, doc_ids, sentences_store = load_bm25_index(index_dir)
 
-        # ----------------------------------------------------------------
+        # ------------------------------------------------------------------
         # 阶段1：BM25 文档检索
-        # ----------------------------------------------------------------
-        # 对 claim 做和建索引时完全相同的分词处理，保证一致性
+        # 分词方式与建索引时完全一致（_tokenize），保证词表对齐
+        # ------------------------------------------------------------------
         query_tokens = _tokenize(claim)
-
         if not query_tokens:
             return "RETRIEVAL_ERROR: claim 分词后为空，无法检索。"
 
-        # get_top_n 返回得分最高的 bm25_top_n 篇文档的 id
-        # 内部调用 BM25Okapi.get_scores() 对全量文档打分，再取 top-n
         top_doc_ids = bm25.get_top_n(query_tokens, doc_ids, n=bm25_top_n)
-
         if not top_doc_ids:
             return "RETRIEVAL_ERROR: BM25 未能检索到任何文档。"
 
-        logger.debug(f"BM25 召回文档：{top_doc_ids}")
+        logger.debug(f"BM25 召回文档（Top-{bm25_top_n}）：{top_doc_ids}")
 
-        # ----------------------------------------------------------------
-        # 阶段2：从召回文档中收集候选句子
-        # ----------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # 阶段2（前半）：收集候选句子
+        # 每篇文档最多取 MAX_SENTENCES_PER_DOC 句，防止长文章独占候选池
+        # ------------------------------------------------------------------
         candidate_sentences = []  # [(doc_id, sent_id, sent_text), ...]
 
         for doc_id in top_doc_ids:
             sent_dict = sentences_store.get(doc_id, {})
             if not sent_dict:
-                continue  # 该文档没有句子数据，跳过
+                continue
 
-            # 按句子编号排序，保证顺序稳定
-            for sent_id in sorted(sent_dict.keys()):
+            doc_count = 0
+            for sent_id in sorted(sent_dict.keys()):  # 按编号顺序读取
                 sent_text = sent_dict[sent_id]
-                # 过滤过短的句子（通常是噪声或空行残留）
-                if len(sent_text) < 15:
+                if len(sent_text) < 15:  # 过滤噪声短句
                     continue
                 candidate_sentences.append((doc_id, sent_id, sent_text))
-                # 每篇文档最多取 MAX_SENTENCES_PER_DOC 句，防止长文章占主导
-                doc_sent_count = sum(1 for d, _, _ in candidate_sentences if d == doc_id)
-                if doc_sent_count >= MAX_SENTENCES_PER_DOC:
-                    break
+                doc_count += 1
+                if doc_count >= MAX_SENTENCES_PER_DOC:
+                    break  # 截断超长文章
 
         if not candidate_sentences:
             return "RETRIEVAL_ERROR: 召回文档中未找到有效句子。"
 
-        logger.debug(f"候选句子数：{len(candidate_sentences)}")
+        logger.debug(f"候选句子总数：{len(candidate_sentences)}")
 
-        # ----------------------------------------------------------------
-        # 阶段2：Sentence-BERT 句子筛选
-        # ----------------------------------------------------------------
-        # 提取纯文本列表供编码
+        # ------------------------------------------------------------------
+        # 阶段2（后半）：Sentence-BERT 语义排序
+        # ------------------------------------------------------------------
         sent_texts = [s[2] for s in candidate_sentences]
+        model      = get_st_model()
 
-        model = get_st_model()
-
-        # encode 返回 tensor，convert_to_tensor=True 使后续 cos_sim 在 GPU/CPU 上高效运行
         claim_embedding  = model.encode(claim,      convert_to_tensor=True)
         corpus_embedding = model.encode(sent_texts, convert_to_tensor=True)
 
-        # cos_sim 返回 (1, N) 的相似度矩阵，取第0行得到每句的得分
+        # cos_sim 返回 (1, N) 矩阵，取第0行得到每句对 claim 的相似度分数
         cos_scores = util.cos_sim(claim_embedding, corpus_embedding)[0]
 
-        # topk：k 不超过候选句子总数
-        actual_k = min(sbert_top_k, len(candidate_sentences))
+        actual_k    = min(sbert_top_k, len(candidate_sentences))
         top_results = torch.topk(cos_scores, k=actual_k)
-
-        # top_results.indices 是得分最高的句子在 candidate_sentences 中的下标
         top_indices = top_results.indices.tolist()
 
-        # ----------------------------------------------------------------
-        # 阶段3：格式化证据输出
-        # ----------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # 格式化证据输出，带来源标注
+        # ------------------------------------------------------------------
         evidence_lines = []
         for rank, idx in enumerate(top_indices, start=1):
             doc_id, sent_id, sent_text = candidate_sentences[idx]
-            # 带来源标注：方便实验报告分析检索结果，也帮助 LLM 定位信息来源
-            # doc_id 中的下划线还原为空格，更易读
-            readable_title = doc_id.replace("_", " ")
+            readable_title = doc_id.replace("_", " ")  # 下划线还原为空格，更易读
             evidence_lines.append(
                 f"[{rank}] ({readable_title}, 句#{sent_id}) {sent_text}"
             )
@@ -447,7 +441,6 @@ def retrieve_evidence_from_dump(
         return evidence_text
 
     except FileNotFoundError as e:
-        # 索引未构建时给出明确提示
         return f"RETRIEVAL_ERROR: 索引未找到。{str(e)}"
     except Exception as e:
         logger.exception("retrieve_evidence_from_dump 发生异常")
@@ -481,8 +474,8 @@ def retrieve_evidence_pipeline(claim, entity_query, top_k_sentences=3):
         if not all_sentences:
             return "ERROR: 无法从页面提取有效内容。"
 
-        model = get_st_model()
-        claim_embedding  = model.encode(claim,         convert_to_tensor=True)
+        model             = get_st_model()
+        claim_embedding   = model.encode(claim,         convert_to_tensor=True)
         corpus_embeddings = model.encode(all_sentences, convert_to_tensor=True)
 
         cos_scores  = util.cos_sim(claim_embedding, corpus_embeddings)[0]
