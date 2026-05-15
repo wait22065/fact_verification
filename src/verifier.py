@@ -5,124 +5,91 @@ import time
 from tqdm import tqdm
 from src.api_client import create_client
 from src.prompt_builder import (
-    build_verification_prompt,
-    parse_model_response,
-    save_parse_errors,
-    clear_parse_errors
+    build_verification_prompt, build_cot_prompt, build_rag_prompt,
+    build_rag_cot_prompt, build_llm_judge_prompt, parse_model_response
 )
-from src.utils import save_json
-from src.config import RESULTS_FILE
-
+from src import config
+from src.retriever import retrieve_evidence, retrieve_evidence_pipeline
 
 class FactVerifier:
-    """事实验证器"""
-
     def __init__(self, logger):
-        """
-        初始化验证器
-
-        Args:
-            logger: 日志对象
-        """
         self.logger = logger
-        self.client = create_client()
-        self.results = []
+        self.client = create_client(logger) # 传入 logger 避免 print 破坏进度条
 
     def verify_claims(self, data_list):
-        """
-        批量验证claims
+        self.logger.info(f"开始执行验证流水线 (Mode: {config.EXPERIMENT_MODE})")
+        y_true, y_pred, detailed_results = [], [], []
 
-        Args:
-            data_list: 数据列表，每个元素包含 {'id', 'claim', 'label'}
+        # Tqdm 进度条配置
+        pbar = tqdm(data_list, total=len(data_list), desc="🔍 正在验证", unit="item", colour="green")
 
-        Returns:
-            dict: 包含预测结果和真实标签的字典
-        """
-        self.logger.info(f"开始验证 {len(data_list)} 条数据...")
+        for item in pbar:
+            claim_id, claim, true_label = item['id'], item['claim'], item['label']
+            pbar.set_postfix({"ID": claim_id})
+            # 把信息写在进度条的后缀里，这样它就在同一行变动，不会换行
+            pbar.set_description(f"🔍 正在校验: {claim_id[:15]}") 
 
-        # 清空之前的解析错误记录
-        clear_parse_errors()
+            # 使用全局 mode 运行批量测试
+            prediction, raw_response, evidence = self._verify_single_claim(
+                claim, claim_id=claim_id, mode=config.EXPERIMENT_MODE, top_k=config.RETRIEVER_TOP_K
+            )
 
-        y_true = []  # 真实标签
-        y_pred = []  # 预测标签
-        detailed_results = []  # 详细结果
+            detailed_results.append({
+                'id': claim_id, 'claim': claim, 'true_label': true_label,
+                'predicted_label': prediction, 'evidence': evidence,
+                'correct': prediction == true_label
+            })
 
-        # 使用tqdm显示进度
-        for item in tqdm(data_list, desc="验证进度"):
-            claim_id = item['id']
-            claim = item['claim']
-            true_label = item['label']
-
-            # 验证单条claim
-            prediction = self._verify_single_claim(claim, claim_id)
-
-            # 记录结果
-            result = {
-                'id': claim_id,
-                'claim': claim,
-                'true_label': true_label,
-                'predicted_label': prediction,
-                'correct': prediction == true_label if prediction else False
-            }
-
-            detailed_results.append(result)
-
-            # 只有成功预测的才加入评估
-            if prediction:
+            if prediction and "ERROR" not in prediction:
                 y_true.append(true_label)
                 y_pred.append(prediction)
-            else:
-                self.logger.warning(f"ID {claim_id} 预测失败，跳过")
-
-            # 添加小延迟避免API速率限制
-            time.sleep(0.5)
-
-        self.logger.info(f"验证完成！成功: {len(y_pred)}/{len(data_list)}")
-
-        # 保存解析错误日志
-        save_parse_errors()
+            
+            time.sleep(0.1)
 
         return {
-            'y_true': y_true,
-            'y_pred': y_pred,
-            'detailed_results': detailed_results
+            'y_true': y_true, 'y_pred': y_pred, 'detailed_results': detailed_results
         }
 
-    def _verify_single_claim(self, claim, claim_id=None):
+    def _verify_single_claim(self, claim, claim_id=None, num_sentences=3, mode=None, top_k=1):
         """
-        验证单条claim
-
-        Args:
-            claim: 待验证的声明
-            claim_id: claim的ID（用于错误记录）
-
-        Returns:
-            str: 预测的标签，失败返回None
+        接收外部传入的 mode 和 top_k，而不是依赖 config (解决Web端并发冲突)
         """
-        # 构造prompt（任务一：只包含claim）
-        prompt = build_verification_prompt(claim)
+        mode = mode or config.EXPERIMENT_MODE
+        evidence = None
+        search_query = claim
 
-        # 调用API
+        # 提取实体
+        if mode in ["RAG", "RAG_COT", "EXTENDED_PIPELINE"]:
+            kw_prompt = f"Return 1-2 core keywords from this claim for Wikipedia search: '{claim}'. Reply ONLY with the keywords, separated by space."
+            extracted = self.client.call_api(kw_prompt)
+            if extracted and len(extracted.split()) <= 6:
+                search_query = extracted.strip("'\"., ")
+
+        # 扩展流水线 (多跳检索 + 裁判模型)
+        if mode == "EXTENDED_PIPELINE":
+            # self.logger.info(f"多跳检索中: {search_query}")
+            evidence = retrieve_evidence_pipeline(claim, search_query, top_k_sentences=3)
+            prompt = build_llm_judge_prompt(claim, evidence)
+        
+        # 基础任务
+        elif mode == "COT":
+            prompt = build_cot_prompt(claim)
+        elif mode == "RAG":
+            evidence = retrieve_evidence(search_query, top_k=top_k, num_sentences=num_sentences)
+            prompt = build_rag_prompt(claim, evidence)
+        elif mode == "RAG_COT":
+            evidence = retrieve_evidence(search_query, top_k=top_k, num_sentences=num_sentences)
+            prompt = build_rag_cot_prompt(claim, evidence)
+        else: # BASELINE
+            prompt = build_verification_prompt(claim)
+
         response = self.client.call_api(prompt)
-
-        if not response:
-            return None
-
-        # 解析响应（传入claim_id和claim用于错误记录）
+        if not response: return "ERROR", None, evidence
+        
         prediction = parse_model_response(response, claim_id=claim_id, claim=claim)
+        return prediction, response, evidence
 
-        if not prediction:
-            self.logger.warning(f"无法解析模型响应 (ID: {claim_id})")
-
-        return prediction
-
-    def save_results(self, results, output_path=RESULTS_FILE):
-        """
-        保存验证结果
-
-        Args:
-            results: 结果字典
-            output_path: 输出文件路径
-        """
-        save_json(results, output_path)
-        self.logger.info(f"结果已保存到: {output_path}")
+    def save_results(self, results, output_path):
+        import json
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)

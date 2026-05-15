@@ -97,47 +97,34 @@ def calculate_hallucination_rate(y_true, y_pred):
     hallucination_rate = hallucination_count / len(not_enough_info_indices)
     return hallucination_rate
 
-
 def generate_report(metrics):
-    """
-    生成评估报告
-
-    Args:
-        metrics: 指标字典
-
-    Returns:
-        str: 格式化的报告文本
-    """
+    """生成评估报告"""
     report = "\n" + "=" * 50 + "\n"
-    report += "评估结果\n"
+    report += "✅ 评估结果总结\n"
     report += "=" * 50 + "\n\n"
 
-    # 整体指标
-    report += f"Accuracy (准确率): {metrics['accuracy']:.4f}\n"
-    report += f"Macro Precision (宏平均精确率): {metrics['macro_precision']:.4f}\n"
-    report += f"Macro Recall (宏平均召回率): {metrics['macro_recall']:.4f}\n"
-    report += f"Macro F1-Score (宏平均F1): {metrics['macro_f1']:.4f}\n"
-    report += f"Hallucination Rate (幻觉率): {metrics['hallucination_rate']:.4f}\n\n"
+    report += f"- Accuracy (准确率): {metrics['accuracy']:.4f}\n"
+    report += f"- Macro F1-Score (宏平均F1): {metrics['macro_f1']:.4f}\n"
+    report += f"- Hallucination Rate (幻觉率): {metrics['hallucination_rate']:.4f}\n\n"
 
-    # 各类别详细指标
-    report += "=" * 50 + "\n"
-    report += "各类别详细指标\n"
-    report += "=" * 50 + "\n"
-    report += f"{'类别':<20} {'Precision':<12} {'Recall':<12} {'F1-Score':<12} {'Support':<10}\n"
-    report += "-" * 70 + "\n"
-
+    # 生成 Markdown 格式的表格，方便粘贴到作业报告中
+    report += "### 📊 详细指标 (Markdown格式)\n\n"
+    report += "| 类别 | Precision | Recall | F1-Score | Support |\n"
+    report += "| :--- | :--- | :--- | :--- | :--- |\n"
+    
     for label in VALID_LABELS:
         metrics_class = metrics['per_class_metrics'][label]
-        report += f"{label:<20} {metrics_class['precision']:<12.4f} {metrics_class['recall']:<12.4f} "
-        report += f"{metrics_class['f1']:<12.4f} {metrics_class['support']:<10}\n"
+        report += f"| {label} | {metrics_class['precision']:.4f} | {metrics_class['recall']:.4f} | {metrics_class['f1']:.4f} | {metrics_class['support']} |\n"
 
-    # 混淆矩阵
+    report += f"| **Macro Avg** | **{metrics['macro_precision']:.4f}** | **{metrics['macro_recall']:.4f}** | **{metrics['macro_f1']:.4f}** | - |\n"
+
     report += "\n" + "=" * 50 + "\n"
-    report += "混淆矩阵\n"
+    report += "🔢 混淆矩阵\n"
     report += "=" * 50 + "\n"
     report += print_confusion_matrix(metrics['confusion_matrix'], VALID_LABELS)
 
     return report
+
 
 
 def print_confusion_matrix(conf_matrix, labels):

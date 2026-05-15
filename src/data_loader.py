@@ -7,7 +7,50 @@ import os
 import json
 from pathlib import Path
 from src.config import FEVER_SPLIT, SAMPLE_SIZE, RANDOM_SEED, VALID_LABELS
+import os
+import json
+import random
+from pathlib import Path
+from datasets import load_dataset
+# 修改 src/data_loader.py
+import os
+import json
+import random
+from pathlib import Path
 
+def load_hover_data(sample_size=50, seed=42):
+    """读取手动下载的 HoVer 官方 Dev 集文件"""
+    
+    # 刚才让你放文件的路径
+    file_path = "data/cache/hover_dev.json" 
+    
+    if not os.path.exists(file_path):
+        print(f"🚨 错误：找不到文件 {file_path}")
+        print("请确认你已经下载了 Dev set 并重命名放在了 data/cache/ 目录下。")
+        return []
+
+    print(f"✅ 正在读取手动下载的 HoVer 数据: {file_path}")
+    with open(file_path, 'r', encoding='utf-8') as f:
+        raw_data = json.load(f)
+
+    data_list = []
+    for item in raw_data:
+        # HoVer 的标签转换：SUPPORTED -> SUPPORTS, 其他 -> REFUTES
+        # 注意：HoVer 有时用 NOT_SUPPORTED，我们统一转为 REFUTES 适配你的评估模块
+        original_label = item.get('label', '')
+        label = "SUPPORTS" if original_label == "SUPPORTED" else "REFUTES"
+        
+        data_list.append({
+            'id': f"hover_{item.get('uid', 'unknown')}",
+            'claim': item.get('claim', ''),
+            'label': label
+        })
+
+    # 随机采样
+    random.seed(seed)
+    sampled_data = random.sample(data_list, min(sample_size, len(data_list)))
+    print(f"成功加载 {len(sampled_data)} 条 HoVer 真实数据！")
+    return sampled_data
 
 def load_fever_data(split=FEVER_SPLIT, sample_size=SAMPLE_SIZE, seed=RANDOM_SEED):
     """

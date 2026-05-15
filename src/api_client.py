@@ -15,12 +15,12 @@ from src.config import (
     BACKOFF_FACTOR
 )
 
-
 class DeepSeekClient:
     """DeepSeek API客户端"""
 
-    def __init__(self):
+    def __init__(self, logger=None):
         """初始化客户端"""
+        self.logger = logger  # 保存 logger
         if not DEEPSEEK_API_KEY:
             raise ValueError("未设置DEEPSEEK_API_KEY环境变量")
 
@@ -31,52 +31,32 @@ class DeepSeekClient:
         )
 
     def call_api(self, prompt, max_retries=MAX_RETRIES):
-        """
-        调用DeepSeek API
-
-        Args:
-            prompt: 输入的prompt
-            max_retries: 最大重试次数
-
-        Returns:
-            str: 模型的响应文本，失败返回None
-        """
         for attempt in range(max_retries):
             try:
                 response = self.client.chat.completions.create(
                     model=MODEL_NAME,
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ],
+                    messages=[{"role": "user", "content": prompt}],
                     temperature=TEMPERATURE,
                     max_tokens=MAX_TOKENS
                 )
-
-                # 提取响应文本
-                answer = response.choices[0].message.content.strip()
-                return answer
+                return response.choices[0].message.content.strip()
 
             except Exception as e:
-                error_msg = str(e)
-                print(f"API调用失败 (尝试 {attempt + 1}/{max_retries}): {error_msg}")
+                error_msg = f"API调用失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}"
+                
+                # 如果有 logger 就用 logger 输出，否则用 print
+                if self.logger:
+                    self.logger.warning(error_msg)
+                else:
+                    print(error_msg)
 
-                # 如果还有重试机会，等待后重试
                 if attempt < max_retries - 1:
                     wait_time = RETRY_DELAY * (BACKOFF_FACTOR ** attempt)
-                    print(f"等待 {wait_time}秒后重试...")
                     time.sleep(wait_time)
                 else:
-                    print("达到最大重试次数，放弃")
                     return None
-
         return None
 
-
-def create_client():
-    """
-    创建API客户端
-
-    Returns:
-        DeepSeekClient: 客户端实例
-    """
-    return DeepSeekClient()
+def create_client(logger=None):
+    """创建API客户端，支持传入logger"""
+    return DeepSeekClient(logger)
