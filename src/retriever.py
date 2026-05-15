@@ -59,8 +59,8 @@ from src.config import (
 # ---------------------------------------------------------------------------
 
 # ⚠️ 本地代理：部署到海外服务器时注释掉这两行
-os.environ['http_proxy']  = 'http://127.0.0.1:7890'
-os.environ['https_proxy'] = 'http://127.0.0.1:7890'
+os.environ['http_proxy']  = 'http://127.0.0.1:17890'
+os.environ['https_proxy'] = 'http://127.0.0.1:17890'
 
 wikipedia.set_lang("en")
 wikipedia.set_user_agent("FeverFactChecker/1.0 (Student_Project)")

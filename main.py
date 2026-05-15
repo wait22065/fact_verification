@@ -81,6 +81,33 @@ def main():
         print()
 
         # ------------------------------------------------------------------
+        # 步骤1.5：RAG_BM25 模式检查索引，不存在则自动构建
+        # 放在数据加载之后、验证之前，确保构建时的提示不打断数据加载输出
+        # ------------------------------------------------------------------
+        if EXPERIMENT_MODE == "RAG_BM25":
+            from src.config import INDEX_DIR, DUMP_DIR
+            from src.retriever import build_bm25_index
+
+            index_files = ["doc_ids.pkl", "sentences.pkl", "bm25.pkl"]
+            index_missing = any(
+                not os.path.exists(os.path.join(INDEX_DIR, f))
+                for f in index_files
+            )
+
+            if index_missing:
+                logger.info("步骤1.5: BM25 索引不存在，开始自动构建...")
+                print("=" * 60)
+                print("BM25 索引不存在，开始自动构建（仅需一次，约 5-15 分钟）")
+                print(f"  dump 目录：{DUMP_DIR}")
+                print(f"  索引目录：{INDEX_DIR}")
+                print("=" * 60)
+                build_bm25_index(dump_dir=DUMP_DIR, index_dir=INDEX_DIR)
+                logger.info("步骤1.5: BM25 索引构建完成")
+            else:
+                logger.info(f"步骤1.5: BM25 索引已存在于 {INDEX_DIR}，跳过构建")
+                print(f"BM25 索引已就绪：{INDEX_DIR}\n")
+
+        # ------------------------------------------------------------------
         # 步骤2：执行验证
         # ------------------------------------------------------------------
         logger.info("步骤2: 执行事实验证")
