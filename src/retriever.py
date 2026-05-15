@@ -8,10 +8,12 @@ FEVER事实验证系统 - 证据检索模块
      - retrieve_evidence_pipeline()  用于 EXTENDED_PIPELINE 模式
 
   2. 新方案：从本地 FEVER Wikipedia dump 检索
-     - build_bm25_index()            首次运行，构建并持久化 BM25 索引
-     - load_bm25_index()             加载已有索引（进程内单例）
-     - retrieve_evidence_from_dump() 标准两阶段检索
-         阶段1：BM25 文档检索（从500万篇中召回 Top-N 篇文档）
+     - build_bm25_index()             全量构建（540万篇，需大内存，已废弃）
+     - build_bm25_index_filtered()    【推荐】只索引测试集 evidence 涉及的页面，
+                                      内存友好，构建速度快
+     - load_bm25_index()              加载已有索引（进程内单例）
+     - retrieve_evidence_from_dump()  标准两阶段检索
+         阶段1：BM25 文档检索（从过滤后索引中召回 Top-N 篇文档）
          阶段2：Sentence-BERT 句子筛选（从召回文档中选 Top-K 句）
 
 所有可调参数统一在 src/config.py 中设置：
@@ -24,7 +26,7 @@ FEVER事实验证系统 - 证据检索模块
 
 dump 文件格式：
   每行：{"id": "Page_Title", "text": "...", "lines": "0\t句子0\n1\t句子1\n..."}
-  - id     与 FEVER evidence 的 wiki_url 完全对应
+  - id     与 FEVER evidence 的 wikipedia_page 字段完全对应（下划线格式）
   - lines  的句子编号与 FEVER evidence 的 sentence_id 对应
   - -LRB- / -RRB- 等是 dump 对括号的转义，读取时统一还原
 """
@@ -44,7 +46,6 @@ import torch
 from sentence_transformers import SentenceTransformer, util
 from rank_bm25 import BM25Okapi
 
-# 从 config 统一读取所有参数，retriever 本身不再定义任何魔法数字
 from src.config import (
     DUMP_DIR,
     INDEX_DIR,
@@ -148,7 +149,7 @@ def _parse_lines_field(lines_str: str) -> dict:
         try:
             result[int(sent_id_str)] = sent_text
         except ValueError:
-            continue  # 编号不是数字则跳过（不应出现，保险起见）
+            continue
     return result
 
 
@@ -162,7 +163,7 @@ def _tokenize(text: str) -> list:
     return text.lower().split()
 
 # ---------------------------------------------------------------------------
-# 索引构建（首次运行，耗时较长）
+# 全量索引构建（原始版本，540万篇，需大内存，保留备用）
 # ---------------------------------------------------------------------------
 
 def build_bm25_index(
@@ -170,19 +171,15 @@ def build_bm25_index(
     index_dir: str = INDEX_DIR,
 ) -> None:
     """
-    扫描全部 wiki-*.jsonl 文件，构建 BM25 索引并持久化到磁盘。
+    扫描全部 wiki-*.jsonl 文件，构建全量 BM25 索引并持久化到磁盘。
+
+    ⚠️  FEVER dump 共约 540 万篇文章，构建时需要约 20GB+ 内存，
+        普通机器会 MemoryError。推荐改用 build_bm25_index_filtered()。
 
     持久化三个文件：
       doc_ids.pkl    - 文档 id 列表，顺序与 BM25 内部索引对齐
       sentences.pkl  - {doc_id: {sent_id: text}}，供第二阶段句子筛选使用
       bm25.pkl       - BM25Okapi 对象，供文档级检索使用
-
-    BM25 的"文档"单位是整篇 Wikipedia 文章（text 字段），
-    句子级筛选在第二阶段由 Sentence-BERT 完成。
-
-    参数：
-      dump_dir:  wiki-*.jsonl 所在目录（默认读 config.DUMP_DIR）
-      index_dir: 索引保存目录（默认读 config.INDEX_DIR）
     """
     Path(index_dir).mkdir(parents=True, exist_ok=True)
 
@@ -190,7 +187,6 @@ def build_bm25_index(
     sentences_path = os.path.join(index_dir, "sentences.pkl")
     bm25_path      = os.path.join(index_dir, "bm25.pkl")
 
-    # 三个文件都存在则跳过（避免重复构建）
     if all(os.path.exists(p) for p in [doc_ids_path, sentences_path, bm25_path]):
         print(f"BM25 索引已存在于 {index_dir}，跳过构建。")
         print("如需重建，请手动删除该目录后再运行。")
@@ -203,13 +199,12 @@ def build_bm25_index(
             "请先将解压后的 wiki-pages/ 目录放到 data/ 下。"
         )
 
-    print(f"找到 {len(jsonl_files)} 个 jsonl 文件，开始构建 BM25 索引...")
+    print(f"找到 {len(jsonl_files)} 个 jsonl 文件，开始构建全量 BM25 索引...")
     print("预计耗时 5-15 分钟（取决于 CPU 性能），请耐心等待。")
 
-    doc_ids          = []  # 与 tokenized_corpus 下标严格对齐
-    tokenized_corpus = []  # BM25 语料：每篇文档的 token 列表
-    sentences_store  = {}  # {doc_id: {sent_id: text}}
-
+    doc_ids          = []
+    tokenized_corpus = []
+    sentences_store  = {}
     total_docs = 0
     skipped    = 0
 
@@ -234,20 +229,16 @@ def build_bm25_index(
                 text   = record.get("text",  "").strip()
                 lines  = record.get("lines", "").strip()
 
-                # dump 首行通常是空记录，跳过
                 if not doc_id or not text:
                     skipped += 1
                     continue
 
-                # 解析 lines 字段，存储句子供第二阶段使用
                 sent_dict = _parse_lines_field(lines)
                 if not sent_dict:
-                    # lines 为空时回退到 text 字段，视为第0句
                     sent_dict = {0: _clean_text(text)}
 
                 sentences_store[doc_id] = sent_dict
 
-                # BM25 文档级表示：对全文 text 分词
                 tokens = _tokenize(_clean_text(text))
                 if not tokens:
                     skipped += 1
@@ -260,7 +251,6 @@ def build_bm25_index(
     print(f"文档加载完成：{total_docs} 篇有效文档，{skipped} 条记录跳过。")
     print("正在构建 BM25Okapi 索引...")
 
-    # BM25Okapi 默认参数 k1=1.5, b=0.75，是学术界最常用的值
     bm25 = BM25Okapi(tokenized_corpus)
 
     print("索引构建完成，正在持久化到磁盘...")
@@ -277,6 +267,206 @@ def build_bm25_index(
     print(f"  bm25.pkl 已保存")
 
     print(f"\nBM25 索引构建完成！文件存放于：{index_dir}")
+
+
+# ---------------------------------------------------------------------------
+# 过滤索引构建（推荐）：只索引测试集 evidence 涉及的页面
+# ---------------------------------------------------------------------------
+
+def build_bm25_index_filtered(
+    dump_dir:  str = DUMP_DIR,
+    index_dir: str = INDEX_DIR,
+    data_file: str = None,
+) -> None:
+    """
+    只对测试集 evidence_pages 涉及的 Wikipedia 页面构建 BM25 索引。
+
+    相比全量版本（build_bm25_index）的优势：
+      - 内存：全量约 540 万篇需要 20GB+，过滤后通常只有数万篇，几百 MB 以内
+      - 速度：构建时间从数小时缩短到数分钟
+      - 召回质量：检索范围限定在 ground-truth 相关页面，BM25 噪声更低
+
+    页面列表来源：
+      从 data_file（fever_*.json）中读取每条 claim 的 evidence_pages 字段，
+      该字段由 data_loader.py 的 load_fever_data() 在首次下载时一并保存。
+      evidence_pages 中的页面名是下划线格式，与 dump 的 id 字段直接对应，
+      不需要任何额外的格式转换。
+
+    持久化三个文件（与全量版本格式完全相同，load_bm25_index 可直接加载）：
+      doc_ids.pkl    - 过滤后的文档 id 列表
+      sentences.pkl  - {doc_id: {sent_id: text}}
+      bm25.pkl       - BM25Okapi 对象
+
+    Args:
+        dump_dir:  wiki-*.jsonl 所在目录（默认读 config.DUMP_DIR）
+        index_dir: 索引保存目录（默认读 config.INDEX_DIR，覆盖原索引）
+        data_file: fever_*.json 路径；为 None 时自动推断为
+                   data/fever_{FEVER_SPLIT}.json
+    """
+    from src.config import FEVER_SPLIT  # 避免循环导入，局部引入
+
+    # ------------------------------------------------------------------
+    # 步骤1：从 JSON 数据文件中读取需要索引的页面名集合
+    # ------------------------------------------------------------------
+    if data_file is None:
+        data_file = f"data/fever_{FEVER_SPLIT}.json"
+
+    if not os.path.exists(data_file):
+        raise FileNotFoundError(
+            f"找不到数据文件：{data_file}\n"
+            "请先运行 load_fever_data() 生成本地缓存，再构建索引。"
+        )
+
+    print(f"从数据文件读取 evidence 页面列表：{data_file}")
+    with open(data_file, 'r', encoding='utf-8') as f:
+        data_list = json.load(f)
+
+    # 收集所有 claim 的 evidence_pages，合并去重
+    target_pages: set = set()
+    for item in data_list:
+        for page in item.get('evidence_pages', []):
+            if page:
+                target_pages.add(page)
+
+    print(f"数据集共 {len(data_list)} 条 claim，"
+          f"涉及 {len(target_pages)} 个不重复 Wikipedia 页面。")
+
+    if not target_pages:
+        raise ValueError(
+            "未从数据文件中读取到任何 evidence_pages。\n"
+            "请确认 data_loader.py 已更新并重新运行 load_fever_data() 刷新缓存。\n"
+            f"（删除 {data_file} 后重新运行即可重新下载并保存 evidence_pages）"
+        )
+
+    # ------------------------------------------------------------------
+    # 步骤2：检查索引是否已存在，避免重复构建
+    # ------------------------------------------------------------------
+    Path(index_dir).mkdir(parents=True, exist_ok=True)
+
+    doc_ids_path   = os.path.join(index_dir, "doc_ids.pkl")
+    sentences_path = os.path.join(index_dir, "sentences.pkl")
+    bm25_path      = os.path.join(index_dir, "bm25.pkl")
+
+    if all(os.path.exists(p) for p in [doc_ids_path, sentences_path, bm25_path]):
+        print(f"BM25 索引已存在于 {index_dir}，跳过构建。")
+        print("如需重建（例如更换了数据集），请手动删除该目录后再运行。")
+        return
+
+    # ------------------------------------------------------------------
+    # 步骤3：扫描 dump 文件，只保留 target_pages 中的文章
+    # ------------------------------------------------------------------
+    jsonl_files = sorted(glob.glob(os.path.join(dump_dir, "wiki-*.jsonl")))
+    if not jsonl_files:
+        raise FileNotFoundError(
+            f"在 {dump_dir} 下未找到 wiki-*.jsonl 文件。\n"
+            "请先将解压后的 wiki-pages/ 目录放到 data/ 下。"
+        )
+
+    print(f"找到 {len(jsonl_files)} 个 jsonl 文件，开始扫描（只加载目标页面）...")
+
+    doc_ids          = []   # 与 tokenized_corpus 下标严格对齐
+    tokenized_corpus = []   # BM25 语料：每篇文档的 token 列表
+    sentences_store  = {}   # {doc_id: {sent_id: text}}
+
+    total_docs  = 0   # 成功加入索引的文档数
+    skipped     = 0   # 跳过的行数（格式错误 / 不在目标列表）
+    found_pages = set()  # 已找到的页面，用于进度提示和最终统计
+
+    for file_idx, jsonl_path in enumerate(jsonl_files):
+        # 每处理10个文件打印一次进度
+        if (file_idx + 1) % 10 == 0 or file_idx == 0:
+            print(f"  扫描中：{os.path.basename(jsonl_path)} "
+                  f"({file_idx + 1}/{len(jsonl_files)})，"
+                  f"已找到 {len(found_pages)}/{len(target_pages)} 个目标页面...")
+
+        # 如果所有目标页面都已找到，可以提前退出，避免扫描剩余文件
+        if found_pages == target_pages:
+            print(f"  所有目标页面已找到，提前结束扫描（节省时间）。")
+            break
+
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            for raw_line in f:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    skipped += 1
+                    continue
+
+                doc_id = record.get("id",    "").strip()
+                text   = record.get("text",  "").strip()
+                lines  = record.get("lines", "").strip()
+
+                # 不在目标页面集合中，直接跳过（这是过滤的核心逻辑）
+                if doc_id not in target_pages:
+                    continue
+
+                if not doc_id or not text:
+                    skipped += 1
+                    continue
+
+                # 解析 lines 字段为句子字典，供第二阶段 SBERT 筛选使用
+                sent_dict = _parse_lines_field(lines)
+                if not sent_dict:
+                    # lines 为空时回退到 text 字段，视为第0句
+                    sent_dict = {0: _clean_text(text)}
+
+                sentences_store[doc_id] = sent_dict
+
+                # BM25 文档级表示：对全文 text 分词
+                tokens = _tokenize(_clean_text(text))
+                if not tokens:
+                    skipped += 1
+                    continue
+
+                doc_ids.append(doc_id)
+                tokenized_corpus.append(tokens)
+                found_pages.add(doc_id)
+                total_docs += 1
+
+    # ------------------------------------------------------------------
+    # 步骤4：报告未找到的页面（dump 中确实不存在的页面）
+    # ------------------------------------------------------------------
+    missing_pages = target_pages - found_pages
+    print(f"\n扫描完成：")
+    print(f"  目标页面数：{len(target_pages)}")
+    print(f"  成功加载：  {total_docs} 篇文档")
+    print(f"  未找到：    {len(missing_pages)} 个页面（这些页面在 dump 中不存在，属正常现象）")
+    if missing_pages and len(missing_pages) <= 20:
+        # 未找到页面数量较少时打印出来，方便排查
+        print(f"  未找到的页面：{sorted(missing_pages)}")
+
+    if total_docs == 0:
+        raise RuntimeError(
+            "未能加载任何文档！请检查：\n"
+            "  1. dump_dir 路径是否正确\n"
+            "  2. dump 文件是否已完整解压\n"
+            "  3. evidence_pages 中的页面名格式是否与 dump id 匹配（均为下划线格式）"
+        )
+
+    # ------------------------------------------------------------------
+    # 步骤5：构建 BM25 索引并持久化
+    # ------------------------------------------------------------------
+    print(f"\n正在构建 BM25Okapi 索引（{total_docs} 篇文档）...")
+    bm25 = BM25Okapi(tokenized_corpus)
+    print("BM25 索引构建完成。")
+
+    print("正在持久化到磁盘...")
+    with open(doc_ids_path, 'wb') as f:
+        pickle.dump(doc_ids, f)
+    print(f"  doc_ids.pkl 已保存（{len(doc_ids)} 个 id）")
+
+    with open(sentences_path, 'wb') as f:
+        pickle.dump(sentences_store, f)
+    print(f"  sentences.pkl 已保存（{len(sentences_store)} 篇文档）")
+
+    with open(bm25_path, 'wb') as f:
+        pickle.dump(bm25, f)
+    print(f"  bm25.pkl 已保存")
+
+    print(f"\nBM25 过滤索引构建完成！文件存放于：{index_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -307,11 +497,12 @@ def load_bm25_index(index_dir: str = INDEX_DIR):
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"找不到索引文件：{path}\n"
-                "请先运行 build_bm25_index() 构建索引。\n"
-                "示例：from src.retriever import build_bm25_index; build_bm25_index()"
+                "请先运行 build_bm25_index_filtered() 构建索引。\n"
+                "示例：from src.retriever import build_bm25_index_filtered; "
+                "build_bm25_index_filtered()"
             )
 
-    print("正在加载 BM25 索引到内存（首次加载约需 1-3 分钟）...")
+    print("正在加载 BM25 索引到内存（首次加载约需数十秒）...")
 
     with open(doc_ids_path, 'rb') as f:
         _BM25_DOC_IDS = pickle.load(f)
@@ -330,7 +521,7 @@ def load_bm25_index(index_dir: str = INDEX_DIR):
 
 
 # ---------------------------------------------------------------------------
-# 新版两阶段检索主函数
+# 两阶段检索主函数
 # ---------------------------------------------------------------------------
 
 def retrieve_evidence_from_dump(
@@ -344,29 +535,26 @@ def retrieve_evidence_from_dump(
 
     两阶段流程：
       阶段1 - BM25 文档检索：
-        对 claim 分词，用 BM25 从全量索引中召回 bm25_top_n 篇最相关文档。
-        参数 bm25_top_n 默认读 config.BM25_TOP_N_DOCS。
+        对 claim 分词，用 BM25 从索引中召回 bm25_top_n 篇最相关文档。
 
       阶段2 - Sentence-BERT 句子筛选：
         从召回文档中取所有句子（每篇最多 MAX_SENTENCES_PER_DOC 句），
         编码成向量后与 claim 向量做余弦相似度排序，
         返回 Top sbert_top_k 个句子作为最终证据。
-        参数 sbert_top_k 默认读 config.SBERT_TOP_K_SENTENCES。
 
-    参数：
-      claim:       待验证的陈述文本（直接传入，不需要预先提取关键词）
-      bm25_top_n:  覆盖 config 默认值的文档召回数
-      sbert_top_k: 覆盖 config 默认值的最终句子数
-      index_dir:   覆盖 config 默认值的索引目录
+    Args:
+        claim:       待验证的陈述文本（直接传入，不需要预先提取关键词）
+        bm25_top_n:  文档召回数，覆盖 config 默认值
+        sbert_top_k: 最终句子数，覆盖 config 默认值
+        index_dir:   索引目录，覆盖 config 默认值
 
-    返回：
-      带来源标注的证据字符串，格式：
-        [1] (Page Title, 句#0) 句子文本...
-        [2] (Another Page, 句#3) 另一句文本...
-      或以 "RETRIEVAL_ERROR:" 开头的错误信息。
+    Returns:
+        带来源标注的证据字符串，格式：
+          [1] (Page Title, 句#0) 句子文本...
+          [2] (Another Page, 句#3) 另一句文本...
+        或以 "RETRIEVAL_ERROR:" 开头的错误信息。
     """
     try:
-        # 加载索引（单例，第一次调用时从磁盘加载）
         bm25, doc_ids, sentences_store = load_bm25_index(index_dir)
 
         # ------------------------------------------------------------------
@@ -395,14 +583,14 @@ def retrieve_evidence_from_dump(
                 continue
 
             doc_count = 0
-            for sent_id in sorted(sent_dict.keys()):  # 按编号顺序读取
+            for sent_id in sorted(sent_dict.keys()):
                 sent_text = sent_dict[sent_id]
                 if len(sent_text) < 15:  # 过滤噪声短句
                     continue
                 candidate_sentences.append((doc_id, sent_id, sent_text))
                 doc_count += 1
                 if doc_count >= MAX_SENTENCES_PER_DOC:
-                    break  # 截断超长文章
+                    break
 
         if not candidate_sentences:
             return "RETRIEVAL_ERROR: 召回文档中未找到有效句子。"
@@ -431,7 +619,7 @@ def retrieve_evidence_from_dump(
         evidence_lines = []
         for rank, idx in enumerate(top_indices, start=1):
             doc_id, sent_id, sent_text = candidate_sentences[idx]
-            readable_title = doc_id.replace("_", " ")  # 下划线还原为空格，更易读
+            readable_title = doc_id.replace("_", " ")
             evidence_lines.append(
                 f"[{rank}] ({readable_title}, 句#{sent_id}) {sent_text}"
             )
