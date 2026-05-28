@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FEVER AI | 智能事实验证</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #10b981;
+            --primary-glow: rgba(16, 185, 129, 0.2);
+            --bg: #0b0f1a;
+            --card-bg: rgba(23, 32, 53, 0.8);
+        }
+
+        body {
+            background-color: var(--bg);
+            background-image: 
+                radial-gradient(circle at 0% 0%, rgba(16, 185, 129, 0.05) 0%, transparent 50%),
+                radial-gradient(circle at 100% 100%, rgba(59, 130, 246, 0.05) 0%, transparent 50%);
+            color: #e2e8f0;
+            font-family: 'Inter', system-ui, sans-serif;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .sidebar {
+            background: rgba(15, 23, 42, 0.9);
+            border-right: 1px solid rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(20px);
+        }
+
+        .glass-panel {
+            background: var(--card-bg);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 1.25rem;
+            box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+        }
+
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+        .input-container {
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .input-container:focus-within {
+            border-color: var(--primary);
+            box-shadow: 0 0 20px var(--primary-glow);
+            background: rgba(15, 23, 42, 0.8);
+        }
+
+        input[type=range] { appearance: none; background: #1e293b; height: 6px; border-radius: 5px; }
+        input[type=range]::-webkit-slider-thumb {
+            appearance: none; width: 18px; height: 18px; 
+            background: var(--primary); border-radius: 50%; cursor: pointer;
+            box-shadow: 0 0 10px var(--primary-glow);
+        }
+
+        .verdict-badge {
+            padding: 0.5rem 1.5rem;
+            border-radius: 9999px;
+            font-weight: 800;
+            letter-spacing: 0.05em;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .supports { background: rgba(16, 185, 129, 0.1); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.2); }
+        .refutes { background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2); }
+        .nei { background: rgba(59, 130, 246, 0.1); color: #3b82f6; border: 1px solid rgba(59, 130, 246, 0.2); }
+    </style>
+</head>
+<body class="flex">
+
+    <!-- 左侧边栏 -->
+    <aside class="sidebar w-80 flex-shrink-0 flex flex-col p-6 z-10">
+        <div class="mb-10">
+            <h1 class="text-2xl font-extrabold tracking-tighter bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 to-blue-500">
+                FEVER AI
+            </h1>
+            <p class="text-xs text-slate-500 font-medium">智能事实验证引擎 v2.0</p>
+        </div>
+
+        <div class="space-y-8 flex-grow overflow-y-auto no-scrollbar">
+            <!-- 模式选择 -->
+            <div>
+                <label class="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-4">验证模式</label>
+                <div class="space-y-2">
+                    <button onclick="setMode('BASELINE', this)" class="mode-btn w-full text-left px-4 py-3 rounded-xl text-sm transition-all bg-transparent hover:bg-slate-800 text-slate-400">直接判断 (Baseline)</button>
+                    <button onclick="setMode('RAG', this)" class="mode-btn w-full text-left px-4 py-3 rounded-xl text-sm transition-all bg-transparent hover:bg-slate-800 text-slate-400">检索增强 (RAG)</button>
+                    <button onclick="setMode('COT', this)" class="mode-btn w-full text-left px-4 py-3 rounded-xl text-sm transition-all bg-transparent hover:bg-slate-800 text-slate-400">思维链 (CoT)</button>
+                    <button onclick="setMode('RAG_COT', this)" class="mode-btn active w-full text-left px-4 py-3 rounded-xl text-sm transition-all bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">检索 + 思维链</button>
+                </div>
+            </div>
+
+            <!-- 证据长度 -->
+            <div>
+                <div class="flex justify-between items-center mb-4">
+                    <label class="text-xs font-bold text-slate-400 uppercase tracking-widest">证据句数</label>
+                    <span id="sentence-val" class="text-emerald-400 font-mono font-bold">3</span>
+                </div>
+                <input type="range" id="num_sentences" min="1" max="10" value="3" 
+                    class="w-full cursor-pointer"
+                    oninput="document.getElementById('sentence-val').innerText = this.value">
+            </div>
+
+            <!-- 检索数量 Top-K -->
+            <div>
+                <div class="flex justify-between items-center mb-4">
+                    <label class="text-xs font-bold text-slate-400 uppercase tracking-widest">检索源 (Top-K)</label>
+                    <span id="topk-val" class="text-blue-400 font-mono font-bold">1</span>
+                </div>
+                <input type="range" id="top_k" min="1" max="5" value="1" 
+                    class="w-full cursor-pointer"
+                    oninput="document.getElementById('topk-val').innerText = this.value"
+                    style="accent-color: #3b82f6;">
+            </div>
+        </div>
+
+        <div class="mt-auto pt-6 border-t border-white/5">
+            <div class="flex items-center gap-3 text-slate-500">
+                <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
+                <span class="text-xs font-medium">DeepSeek-V3 API 已连接</span>
+            </div>
+        </div>
+    </aside>
+
+    <!-- 主视窗 -->
+    <main class="flex-grow flex flex-col relative overflow-hidden">
+        <div id="display-area" class="flex-grow overflow-y-auto no-scrollbar p-8">
+            <div id="welcome-msg" class="h-full flex flex-col items-center justify-center text-center">
+                <div class="w-20 h-20 mb-6 bg-emerald-500/10 rounded-3xl flex items-center justify-center border border-emerald-500/20">
+                    <svg class="w-10 h-10 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+                </div>
+                <h2 class="text-3xl font-bold mb-2">准备好验证任何事实了吗？</h2>
+                <p class="text-slate-500 max-w-md">输入一个声明，我将通过维基百科进行多维度检索，并结合思维链进行深度推理。</p>
+            </div>
+
+            <div id="results-content" class="max-w-4xl mx-auto space-y-8 hidden">
+                <div class="flex items-center justify-between glass-panel p-6">
+                    <div>
+                        <span class="text-xs font-bold text-slate-500 uppercase tracking-tighter">验证状态</span>
+                        <div id="verdict-wrapper" class="mt-1"></div>
+                    </div>
+                    <div class="text-right">
+                        <span class="text-xs font-bold text-slate-500 uppercase tracking-tighter">处理耗时</span>
+                        <div class="text-emerald-400 font-mono font-bold mt-1" id="timer">0.00s</div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div class="glass-panel flex flex-col">
+                        <div class="px-5 py-3 border-b border-white/5 font-bold text-xs uppercase text-blue-400 tracking-widest">维基百科证据</div>
+                        <div class="p-5 text-sm text-slate-300 leading-relaxed max-h-[400px] overflow-y-auto no-scrollbar" id="evidence-text"></div>
+                    </div>
+                    <div class="glass-panel flex flex-col">
+                        <div class="px-5 py-3 border-b border-white/5 font-bold text-xs uppercase text-emerald-400 tracking-widest">推理分析过程</div>
+                        <div class="p-5 text-sm text-slate-300 leading-relaxed max-h-[400px] overflow-y-auto no-scrollbar" id="reasoning-text"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="p-8 pt-0 mt-auto">
+            <div class="max-w-4xl mx-auto relative">
+                <div class="input-container rounded-2xl p-2 flex items-end gap-2">
+                    <textarea id="claim" rows="1" 
+                        class="flex-grow bg-transparent border-none focus:ring-0 p-4 text-slate-200 placeholder-slate-600 resize-none no-scrollbar text-lg"
+                        placeholder="输入需要校验的事实陈述..."
+                        oninput="this.style.height = ''; this.style.height = this.scrollHeight + 'px'"></textarea>
+                    <button onclick="startVerify()" id="verify-btn"
+                        class="bg-emerald-500 hover:bg-emerald-400 text-slate-900 font-bold p-4 rounded-xl transition-all shadow-lg shadow-emerald-500/20 group">
+                        <svg id="btn-icon" class="w-6 h-6 transition-transform group-hover:scale-110" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+                        <div id="btn-loading" class="hidden"><svg class="animate-spin h-6 w-6 text-slate-900" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg></div>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <input type="hidden" id="current_mode" value="RAG_COT">
+
+    <script>
+        function setMode(mode, el) {
+            document.getElementById('current_mode').value = mode;
+            document.querySelectorAll('.mode-btn').forEach(btn => {
+                btn.className = "mode-btn w-full text-left px-4 py-3 rounded-xl text-sm transition-all bg-transparent hover:bg-slate-800 text-slate-400";
+            });
+            el.className = "mode-btn active w-full text-left px-4 py-3 rounded-xl text-sm transition-all bg-emerald-500/10 text-emerald-400 border border-emerald-500/20";
+        }
+
+        async function startVerify() {
+            const claim = document.getElementById('claim').value;
+            const mode = document.getElementById('current_mode').value;
+            // 🟢 获取滑动条数值
+            const num_sentences = document.getElementById('num_sentences').value;
+            const top_k = document.getElementById('top_k').value;
+            
+            if (!claim.trim()) return;
+
+            const btnIcon = document.getElementById('btn-icon');
+            const btnLoading = document.getElementById('btn-loading');
+            const welcome = document.getElementById('welcome-msg');
+            const content = document.getElementById('results-content');
+            
+            btnIcon.classList.add('hidden');
+            btnLoading.classList.remove('hidden');
+            document.getElementById('verify-btn').disabled = true;
+
+            const startTime = performance.now();
+
+            try {
+                const response = await fetch('/verify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        claim: claim, 
+                        mode: mode, 
+                        num_sentences: num_sentences, // 🟢 传递给后端
+                        top_k: top_k                  // 🟢 传递给后端
+                    })
+                });
+                const data = await response.json();
+
+                const endTime = performance.now();
+                document.getElementById('timer').innerText = ((endTime - startTime) / 1000).toFixed(2) + 's';
+
+                const wrapper = document.getElementById('verdict-wrapper');
+                let badgeClass = 'nei', icon = '❓', text = data.prediction;
+                if(data.prediction === 'SUPPORTS') { badgeClass = 'supports'; icon = '✅'; }
+                else if(data.prediction === 'REFUTES') { badgeClass = 'refutes'; icon = '❌'; }
+                
+                wrapper.innerHTML = `<div class="verdict-badge ${badgeClass} animate__animated animate__bounceIn">
+                    <span>${icon}</span> <span>${text}</span>
+                </div>`;
+
+
+                // 修改后的代码（删除所有星号）
+                const cleanReasoning = data.reasoning.replace(/\*/g, '');
+                
+                document.getElementById('evidence-text').innerText = data.evidence || "未获取到检索证据。";
+                document.getElementById('reasoning-text').innerText = cleanReasoning;
+
+                welcome.classList.add('hidden');
+                content.classList.remove('hidden');
+                content.classList.add('animate__animated', 'animate__fadeInUp');
+
+            } catch (e) {
+                alert("请求失败，请检查后端状态");
+            } finally {
+                btnIcon.classList.remove('hidden');
+                btnLoading.classList.add('hidden');
+                document.getElementById('verify-btn').disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>

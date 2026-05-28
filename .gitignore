@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# 环境变量（包含API密钥）
+.env
+
+# 日志
+logs/
+*.log
+
+# 数据缓存
+data/cache/
+.cache/
+
+# FEVER数据集本地缓存（文件较大，不提交）
+data/fever_*.json
+
+# wiki-pages缓存
+wiki-pages
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# Hugging Face缓存
+.huggingface/
+
+# 结果文件（可选择性提交）
+data/results/
+
+# Claude相关
+.claude/
+
+__MACOSX/
+
+note.txt
+
+config.py
+results/
+bm25_index
+
