@@ -19,6 +19,7 @@ from datetime import datetime
 from src.config import (
     LOG_DIR, RESULTS_DIR, SAMPLE_SIZE, EXPERIMENT_MODE,
     RANDOM_SEED, NUM_ROUNDS,
+    USE_MULTI_HOP, USE_CROSS_ENCODER, USE_LLM_JUDGE, MAX_HOP_ROUNDS,
 )
 from src.utils import setup_logger, format_time
 from src.data_loader import load_fever_data, load_hover_data, get_label_distribution
@@ -210,6 +211,15 @@ def main():
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode_lower = EXPERIMENT_MODE.lower()
 
+    # EXTENDED_PIPELINE 模式：在文件名中追加当前启用的消融开关后缀
+    if EXPERIMENT_MODE == "EXTENDED_PIPELINE":
+        _parts = []
+        if USE_MULTI_HOP:     _parts.append("multihop")
+        if USE_CROSS_ENCODER: _parts.append("ce")
+        if USE_LLM_JUDGE:     _parts.append("judge")
+        if _parts:
+            mode_lower += "_" + "_".join(_parts)
+
     actual_log_file     = os.path.join(LOG_DIR,     f"verification_{mode_lower}_{timestamp}.log")
     actual_results_file = os.path.join(RESULTS_DIR, f"verification_results_{mode_lower}_{timestamp}.json")
 
@@ -246,7 +256,7 @@ def main():
 
     try:
         # ------------------------------------------------------------------
-        # RAG_BM25 模式：在所有轮次开始前检查/构建 BM25 索引
+        # RAG_BM25 模式：在所有轮次开始前检查/构建 FEVER BM25 索引
         # 只检查一次，后续各轮直接复用已有索引，避免重复构建
         # ------------------------------------------------------------------
         if EXPERIMENT_MODE == "RAG_BM25":
@@ -271,6 +281,52 @@ def main():
             else:
                 logger.info(f"BM25 索引已就绪：{INDEX_DIR}，多轮复用")
                 print(f"\nBM25 索引已就绪：{INDEX_DIR}（多轮共用，无需重建）")
+
+        # ------------------------------------------------------------------
+        # EXTENDED_PIPELINE 模式：在所有轮次开始前检查/构建 HoVer BM25 索引
+        # ------------------------------------------------------------------
+        if EXPERIMENT_MODE == "EXTENDED_PIPELINE":
+            from src.config import (
+                HOVER_INDEX_DIR, HOVER_DENSE_INDEX_DIR, DUMP_DIR, RETRIEVAL_MODE
+            )
+            from src.retriever import build_bm25_index_hover, build_dense_index_hover
+
+            if RETRIEVAL_MODE == "DENSE":
+                dense_files   = ["faiss_index.bin", "doc_ids.pkl", "sentences.pkl"]
+                index_missing = any(
+                    not os.path.exists(os.path.join(HOVER_DENSE_INDEX_DIR, f))
+                    for f in dense_files
+                )
+                if index_missing:
+                    logger.info("HoVer Dense 索引不存在，开始自动构建（仅此一次）...")
+                    print("\n" + "=" * 60)
+                    print("HoVer Dense 索引不存在，开始自动构建（仅需一次，约数分钟）")
+                    print(f"  dump 目录：{DUMP_DIR}")
+                    print(f"  索引目录：{HOVER_DENSE_INDEX_DIR}")
+                    print("=" * 60)
+                    build_dense_index_hover(dump_dir=DUMP_DIR, index_dir=HOVER_DENSE_INDEX_DIR)
+                    logger.info("HoVer Dense 索引构建完成，后续轮次直接复用")
+                else:
+                    logger.info(f"HoVer Dense 索引已就绪：{HOVER_DENSE_INDEX_DIR}，多轮复用")
+                    print(f"\nHoVer Dense 索引已就绪：{HOVER_DENSE_INDEX_DIR}（多轮共用，无需重建）")
+            else:
+                index_files   = ["doc_ids.pkl", "sentences.pkl", "bm25.pkl"]
+                index_missing = any(
+                    not os.path.exists(os.path.join(HOVER_INDEX_DIR, f))
+                    for f in index_files
+                )
+                if index_missing:
+                    logger.info("HoVer BM25 索引不存在，开始自动构建（仅此一次）...")
+                    print("\n" + "=" * 60)
+                    print("HoVer BM25 索引不存在，开始自动构建（仅需一次，约数分钟）")
+                    print(f"  dump 目录：{DUMP_DIR}")
+                    print(f"  索引目录：{HOVER_INDEX_DIR}")
+                    print("=" * 60)
+                    build_bm25_index_hover(dump_dir=DUMP_DIR, index_dir=HOVER_INDEX_DIR)
+                    logger.info("HoVer BM25 索引构建完成，后续轮次直接复用")
+                else:
+                    logger.info(f"HoVer BM25 索引已就绪：{HOVER_INDEX_DIR}，多轮复用")
+                    print(f"\nHoVer BM25 索引已就绪：{HOVER_INDEX_DIR}（多轮共用，无需重建）")
 
         # ------------------------------------------------------------------
         # 初始化 FactVerifier（多轮共用同一实例）
@@ -361,15 +417,21 @@ def main():
             "timestamp":       timestamp,
             "num_rounds":      NUM_ROUNDS,
             "valid_rounds":    valid_rounds,
-            "random_seed":     RANDOM_SEED,   # 固定采样 seed，所有轮次共用
+            "random_seed":     RANDOM_SEED,
             "sample_size":     SAMPLE_SIZE,
 
+            # ---- 消融开关快照（仅 EXTENDED_PIPELINE 模式写入） ----
+            **({"ablation_config": {
+                "USE_MULTI_HOP":     USE_MULTI_HOP,
+                "MAX_HOP_ROUNDS":    MAX_HOP_ROUNDS,
+                "USE_CROSS_ENCODER": USE_CROSS_ENCODER,
+                "USE_LLM_JUDGE":     USE_LLM_JUDGE,
+            }} if EXPERIMENT_MODE == "EXTENDED_PIPELINE" else {}),
+
             # ---- 汇总指标（均值 ± 标准差） ----
-            # 格式：{"accuracy": {"mean": 0.82, "std": 0.03}, ...}
             "aggregated_metrics": aggregated,
 
             # ---- 每轮明细 ----
-            # 列表长度 == valid_rounds，每项包含 round / metrics / detailed_results / summary
             "rounds": all_round_results,
         }
 

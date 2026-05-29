@@ -16,7 +16,8 @@ from tqdm import tqdm
 from src.api_client import create_client
 from src.prompt_builder import (
     build_verification_prompt, build_cot_prompt, build_rag_prompt,
-    build_rag_cot_prompt, build_llm_judge_prompt, build_judge_review_prompt,
+    build_rag_cot_prompt, build_llm_judge_prompt, build_extended_pipeline_judge_prompt,
+    build_judge_review_prompt,
     build_ircot_hop_prompt, parse_ircot_action, parse_model_response
 )
 from src import config
@@ -212,7 +213,7 @@ class FactVerifier:
                     searched_titles.add(query)
                     recent_queries.append(query)  # 记录用于下一跳的相似度检测
 
-                    # 本地检索（使用 HoVer 专属索引）
+                    # 本地检索（检索模式由 config.RETRIEVAL_MODE 控制，函数内部处理）
                     hop_evidence = retrieve_evidence_local_hop(
                         query, claim, top_k=2, index_dir=config.HOVER_INDEX_DIR
                     )
@@ -240,10 +241,11 @@ class FactVerifier:
                 evidence = "\n\n".join(accumulated_evidence) if accumulated_evidence else "No evidence retrieved."
 
             else:
-                # 非多跳：本地检索，直接用 claim 全文做 BM25+SBERT（HoVer 索引）
+                # 非多跳：本地检索（检索模式由 config.RETRIEVAL_MODE 控制，函数内部处理）
                 evidence = retrieve_evidence_from_dump(claim, index_dir=config.HOVER_INDEX_DIR)
 
-            # Step 1: 基础核验（仅 SUPPORTS/REFUTES，与 HoVer 二分类标签对齐）
+            # Step 1: 基础核验（逐子句验证版，仅 SUPPORTS/REFUTES，与 HoVer 二分类标签对齐）
+            # base_prompt   = build_extended_pipeline_judge_prompt(claim, evidence)
             base_prompt   = build_llm_judge_prompt(claim, evidence)
             base_response = self.client.call_api(base_prompt)
             if not base_response:

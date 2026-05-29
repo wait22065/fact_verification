@@ -276,6 +276,79 @@ def parse_ircot_action(response):
     return ('done', None)
 
 
+# =============================================================================
+# 注：build_extended_pipeline_judge_prompt 曾尝试用 few-shot 引导逐子句验证，
+# 但实验发现在检索不完整时容易产生系统性偏差（规则引导→模型过度执行）：
+#   - 三态标签版（CONFIRMED/CONTRADICTED/UNSUPPORTED）：UNSUPPORTED→SUPPORTS 规则
+#     导致大量 REFUTES 被误判为 SUPPORTS（64%，REFUTES召回仅36%）
+#   - few-shot+规则版：ANY contradicted→REFUTES 导致大量 SUPPORTS 被误判为 REFUTES
+#     （64%，SUPPORTS召回仅39%）
+#   - 纯 few-shot 无规则版：same bias，SUPPORTS召回39%
+# 根本原因：检索失败时二分类强制选边，判断层无法弥补检索层缺陷。
+# 当前 EXTENDED_PIPELINE 恢复使用 build_llm_judge_prompt（简单版，72%）。
+# =============================================================================
+def build_extended_pipeline_judge_prompt(claim, evidence):
+    """
+    EXTENDED_PIPELINE 专用校验 prompt（few-shot 引导版）。
+    用两个 few-shot 例子教 LLM 逐一核查声明的每个具体断言；
+    最终判断用自由推理而非刚性标签，避免"无证据→一律 SUPPORTS"的偏差。
+    """
+    few_shot = """\
+The following two examples show how to verify a multi-hop claim step by step.
+
+--- Example 1 (result: SUPPORTS) ---
+
+Claim: "The largest lake in New Hampshire sits nine vertical feet lower than Lake Kanasatka."
+
+Evidence:
+[Hop 1: Lake Kanasatka]
+• Lake Kanasatka is a 358-acre lake in Carroll County, New Hampshire, located one-half mile
+  north of and nine vertical feet higher than Lake Winnipesaukee.
+
+Analysis:
+The claim makes two assertions: (1) Lake Kanasatka is in New Hampshire; (2) the largest NH
+lake is nine vertical feet lower than Kanasatka.
+(1) "Carroll County, New Hampshire" — confirmed.
+(2) "nine vertical feet higher than Lake Winnipesaukee" — directional equivalence: Kanasatka
+is higher, so Winnipesaukee is nine feet lower. Winnipesaukee is the largest lake in NH.
+No assertion is contradicted by the evidence.
+
+Final Label: SUPPORTS
+
+--- Example 2 (result: REFUTES) ---
+
+Claim: "Celtic FC is an English professional football club that was founded in 1887."
+
+Evidence:
+[Hop 1: Celtic FC]
+• Celtic is a professional football club based in Glasgow, Scotland.
+• The club was founded in 1887 by Brother Walfrid.
+
+Analysis:
+"professional football club" — confirmed. "founded in 1887" — confirmed.
+But "Glasgow, Scotland" — Celtic is based in Scotland, which contradicts "English".
+Even though the other details are confirmed, the nationality is wrong.
+
+Final Label: REFUTES
+---
+"""
+
+    return (
+        f"You are a fact-checking system verifying a multi-hop claim against retrieved "
+        f"Wikipedia evidence.\n"
+        f"Study the two examples carefully, then verify the new claim in the same way.\n\n"
+        f"{few_shot}\n"
+        f"Now verify this claim:\n\n"
+        f"Claim: {claim}\n\n"
+        f"Evidence:\n{evidence}\n\n"
+        f"Analysis:\n"
+        f"[Examine what the evidence says about each specific element of the claim — "
+        f"entity, location, nationality, date, relationship, attribute. "
+        f"Note where evidence agrees, where it disagrees, and give your overall verdict.]\n\n"
+        f"Final Label: SUPPORTS or REFUTES"
+    )
+
+
 def build_judge_review_prompt(claim, evidence, initial_label):
     """LLM Judge 二次核验 prompt：对基础核验的初步判断进行再审，可纠正错误标签。"""
     return f"""You are an impartial LLM Judge reviewing a fact-checking decision.

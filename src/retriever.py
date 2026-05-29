@@ -140,7 +140,8 @@ def _extract_infobox(page) -> list:
 # ---------------------------------------------------------------------------
 # BM25 相关缓存（按 index_dir 键分开缓存，支持 FEVER 和 HoVer 两个索引并存）
 # ---------------------------------------------------------------------------
-_BM25_CACHE: dict = {}  # {index_dir: (bm25, doc_ids, sentences_store)}
+_BM25_CACHE:  dict = {}  # {index_dir: (bm25, doc_ids, sentences_store)}
+_DENSE_CACHE: dict = {}  # {index_dir: (faiss_index, doc_ids, sentences_store)}
 
 # ---------------------------------------------------------------------------
 # 内部工具函数
@@ -647,6 +648,150 @@ def build_bm25_index_hover(
     print(f"\nHoVer BM25 索引构建完成！文件存放于：{index_dir}")
 
 
+def build_dense_index_hover(
+    dump_dir:  str = DUMP_DIR,
+    index_dir: str = None,
+    data_file: str = "data/cache/hover_dev.json",
+) -> None:
+    """
+    为 HoVer 数据集构建 FAISS Dense 向量索引。
+    页面过滤逻辑与 build_bm25_index_hover 相同（只索引 supporting_facts 中的页面），
+    区别在于用 SBERT 对文档全文编码，构建 IndexFlatIP（余弦相似度）索引。
+
+    索引文件：faiss_index.bin / doc_ids.pkl / sentences.pkl
+    """
+    import faiss
+    import numpy as np
+    from src.config import HOVER_DENSE_INDEX_DIR
+    if index_dir is None:
+        index_dir = HOVER_DENSE_INDEX_DIR
+
+    if not os.path.exists(data_file):
+        raise FileNotFoundError(
+            f"找不到 HoVer 数据文件：{data_file}\n"
+            "请确认已将 hover_dev_release_v1.1.json 重命名为 hover_dev.json "
+            "并放置到 data/cache/ 目录。"
+        )
+
+    print(f"从 HoVer 数据文件提取目标页面：{data_file}")
+    with open(data_file, 'r', encoding='utf-8') as f:
+        raw_data = json.load(f)
+
+    target_pages: set = set()
+    for item in raw_data:
+        for fact in item.get('supporting_facts', []):
+            if fact and len(fact) >= 1:
+                page = str(fact[0]).replace(' ', '_')
+                if page:
+                    target_pages.add(page)
+
+    print(f"HoVer 数据集共 {len(raw_data)} 条 claim，"
+          f"涉及 {len(target_pages)} 个不重复 Wikipedia 页面。")
+
+    if not target_pages:
+        raise ValueError("未从 HoVer 数据中读取到任何 supporting_facts 页面。")
+
+    Path(index_dir).mkdir(parents=True, exist_ok=True)
+    faiss_path     = os.path.join(index_dir, "faiss_index.bin")
+    doc_ids_path   = os.path.join(index_dir, "doc_ids.pkl")
+    sentences_path = os.path.join(index_dir, "sentences.pkl")
+
+    if all(os.path.exists(p) for p in [faiss_path, doc_ids_path, sentences_path]):
+        print(f"HoVer Dense 索引已存在于 {index_dir}，跳过构建。")
+        print("如需重建，请手动删除该目录后再运行。")
+        return
+
+    jsonl_files = sorted(glob.glob(os.path.join(dump_dir, "wiki-*.jsonl")))
+    if not jsonl_files:
+        raise FileNotFoundError(f"在 {dump_dir} 下未找到 wiki-*.jsonl 文件。")
+
+    print(f"找到 {len(jsonl_files)} 个 jsonl 文件，开始扫描（只加载目标页面）...")
+
+    doc_ids         = []
+    raw_texts       = []
+    sentences_store = {}
+    total_docs  = 0
+    skipped     = 0
+    found_pages = set()
+
+    for file_idx, jsonl_path in enumerate(jsonl_files):
+        if (file_idx + 1) % 10 == 0 or file_idx == 0:
+            print(f"  扫描中：{os.path.basename(jsonl_path)} "
+                  f"({file_idx + 1}/{len(jsonl_files)})，"
+                  f"已找到 {len(found_pages)}/{len(target_pages)} 个目标页面...")
+
+        if found_pages == target_pages:
+            print("  所有目标页面已找到，提前结束扫描。")
+            break
+
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            for raw_line in f:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    skipped += 1
+                    continue
+
+                doc_id = record.get("id",    "").strip()
+                text   = record.get("text",  "").strip()
+                lines  = record.get("lines", "").strip()
+
+                if doc_id not in target_pages:
+                    continue
+                if not doc_id or not text:
+                    skipped += 1
+                    continue
+
+                sent_dict = _parse_lines_field(lines)
+                if not sent_dict:
+                    sent_dict = {0: _clean_text(text)}
+
+                sentences_store[doc_id] = sent_dict
+
+                clean = _clean_text(text)
+                if not clean:
+                    skipped += 1
+                    continue
+
+                doc_ids.append(doc_id)
+                raw_texts.append(clean)
+                found_pages.add(doc_id)
+                total_docs += 1
+
+    missing_pages = target_pages - found_pages
+    print(f"\n扫描完成：目标 {len(target_pages)} 页，"
+          f"成功加载 {total_docs} 篇，未找到 {len(missing_pages)} 个。")
+    if missing_pages and len(missing_pages) <= 20:
+        print(f"  未找到的页面：{sorted(missing_pages)}")
+
+    if total_docs == 0:
+        raise RuntimeError("未能加载任何文档，请检查 dump_dir 路径和文件完整性。")
+
+    print(f"\n正在向量化 {total_docs} 篇文档（batch_size=64）...")
+    model = get_st_model()
+    doc_vectors = model.encode(
+        raw_texts,
+        batch_size=64,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    ).astype(np.float32)
+
+    dim = doc_vectors.shape[1]
+    print(f"向量维度：{dim}，构建 IndexFlatIP...")
+    index = faiss.IndexFlatIP(dim)
+    index.add(doc_vectors)
+
+    print("正在持久化到磁盘...")
+    faiss.write_index(index, faiss_path)
+    with open(doc_ids_path,   'wb') as f: pickle.dump(doc_ids,         f)
+    with open(sentences_path, 'wb') as f: pickle.dump(sentences_store, f)
+    print(f"\nHoVer Dense 索引构建完成！文件存放于：{index_dir}")
+
+
 # ---------------------------------------------------------------------------
 # 索引加载（进程内单例，只加载一次）
 # ---------------------------------------------------------------------------
@@ -688,15 +833,52 @@ def load_bm25_index(index_dir: str = INDEX_DIR):
     return bm25, doc_ids, sentences_store
 
 
+def load_dense_index(index_dir: str = None):
+    """
+    懒加载 FAISS Dense 索引，按 index_dir 缓存，进程内只加载一次。
+    返回：(faiss_index, doc_ids, sentences_store)
+    """
+    import faiss
+    from src.config import HOVER_DENSE_INDEX_DIR
+    if index_dir is None:
+        index_dir = HOVER_DENSE_INDEX_DIR
+
+    global _DENSE_CACHE
+    if index_dir in _DENSE_CACHE:
+        return _DENSE_CACHE[index_dir]
+
+    faiss_path     = os.path.join(index_dir, "faiss_index.bin")
+    doc_ids_path   = os.path.join(index_dir, "doc_ids.pkl")
+    sentences_path = os.path.join(index_dir, "sentences.pkl")
+
+    for path in [faiss_path, doc_ids_path, sentences_path]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"找不到 Dense 索引文件：{path}\n"
+                "请先运行 build_dense_index_hover() 构建索引，"
+                "或将 config.RETRIEVAL_MODE 设为 'BM25'。"
+            )
+
+    print(f"正在加载 FAISS Dense 索引（{index_dir}）...")
+    index = faiss.read_index(faiss_path)
+    with open(doc_ids_path,   'rb') as f: doc_ids         = pickle.load(f)
+    with open(sentences_path, 'rb') as f: sentences_store = pickle.load(f)
+
+    print(f"  加载完成：{len(doc_ids)} 篇文档，向量维度 {index.d}")
+    _DENSE_CACHE[index_dir] = (index, doc_ids, sentences_store)
+    return index, doc_ids, sentences_store
+
+
 # ---------------------------------------------------------------------------
 # 两阶段检索主函数
 # ---------------------------------------------------------------------------
 
 def retrieve_evidence_from_dump(
-    claim:       str,
-    bm25_top_n:  int = BM25_TOP_N_DOCS,
-    sbert_top_k: int = SBERT_TOP_K_SENTENCES,
-    index_dir:   str = INDEX_DIR,
+    claim:           str,
+    bm25_top_n:      int = BM25_TOP_N_DOCS,
+    sbert_top_k:     int = SBERT_TOP_K_SENTENCES,
+    index_dir:       str = INDEX_DIR,
+    dense_index_dir: str = None,
 ) -> str:
     """
     从本地 FEVER Wikipedia dump 中检索与 claim 相关的证据。
@@ -723,21 +905,50 @@ def retrieve_evidence_from_dump(
         或以 "RETRIEVAL_ERROR:" 开头的错误信息。
     """
     try:
-        bm25, doc_ids, sentences_store = load_bm25_index(index_dir)
+        from src.config import RETRIEVAL_MODE, HOVER_DENSE_INDEX_DIR
 
         # ------------------------------------------------------------------
-        # 阶段1：BM25 文档检索
-        # 分词方式与建索引时完全一致（_tokenize），保证词表对齐
+        # 阶段1：文档检索
+        # BM25 / DENSE / HYBRID（并集）三种模式，输出统一为 top_doc_ids + sentences_store
         # ------------------------------------------------------------------
-        query_tokens = _tokenize(claim)
-        if not query_tokens:
-            return "RETRIEVAL_ERROR: claim 分词后为空，无法检索。"
+        if RETRIEVAL_MODE in ("BM25", "HYBRID"):
+            bm25, bm25_doc_ids, sentences_store = load_bm25_index(index_dir)
+            query_tokens = _tokenize(claim)
+            bm25_top = (
+                bm25.get_top_n(query_tokens, bm25_doc_ids, n=bm25_top_n)
+                if query_tokens else []
+            )
+            logger.debug(f"BM25 召回文档（Top-{bm25_top_n}）：{bm25_top}")
 
-        top_doc_ids = bm25.get_top_n(query_tokens, doc_ids, n=bm25_top_n)
-        if not top_doc_ids:
-            return "RETRIEVAL_ERROR: BM25 未能检索到任何文档。"
+        if RETRIEVAL_MODE in ("DENSE", "HYBRID"):
+            import numpy as np
+            _dense_dir = dense_index_dir or HOVER_DENSE_INDEX_DIR
+            faiss_index, dense_doc_ids, dense_sentences = load_dense_index(_dense_dir)
+            model     = get_st_model()
+            query_vec = model.encode(
+                [claim], convert_to_numpy=True, normalize_embeddings=True,
+            ).astype(np.float32)
+            n_search  = min(bm25_top_n, len(dense_doc_ids))
+            _, indices = faiss_index.search(query_vec, n_search)
+            dense_top  = [dense_doc_ids[i] for i in indices[0].tolist() if i >= 0]
+            logger.debug(f"FAISS 召回文档（Top-{n_search}）：{dense_top}")
 
-        logger.debug(f"BM25 召回文档（Top-{bm25_top_n}）：{top_doc_ids}")
+        # 合并结果
+        if RETRIEVAL_MODE == "BM25":
+            top_doc_ids = bm25_top
+            if not top_doc_ids:
+                return "RETRIEVAL_ERROR: BM25 未能检索到任何文档。"
+        elif RETRIEVAL_MODE == "DENSE":
+            top_doc_ids     = dense_top
+            sentences_store = dense_sentences
+            if not top_doc_ids:
+                return "RETRIEVAL_ERROR: FAISS 未能检索到任何文档。"
+        else:  # HYBRID：BM25 结果打头，Dense 补充不重复的
+            seen        = set(bm25_top)
+            top_doc_ids = bm25_top + [d for d in dense_top if d not in seen]
+            # sentences_store 两个索引内容相同，复用 BM25 的即可
+            if not top_doc_ids:
+                return "RETRIEVAL_ERROR: BM25 和 FAISS 均未能检索到任何文档。"
 
         # ------------------------------------------------------------------
         # 阶段2（前半）：收集候选句子
@@ -808,10 +1019,11 @@ def retrieve_evidence_from_dump(
 # ---------------------------------------------------------------------------
 
 def retrieve_evidence_local_hop(
-    article_title: str,
-    claim: str,
-    top_k: int = 2,
-    index_dir: str = INDEX_DIR,
+    article_title:   str,
+    claim:           str,
+    top_k:           int = 2,
+    index_dir:       str = INDEX_DIR,
+    dense_index_dir: str = None,
 ) -> str:
     """
     从本地 dump 检索指定 Wikipedia 文章中与 claim 最相关的句子。
@@ -823,7 +1035,15 @@ def retrieve_evidence_local_hop(
       3. 未精确命中：用 article_title 做 BM25 全库检索（top-3 文档），再 SBERT 排序
     """
     try:
-        bm25, doc_ids, sentences_store = load_bm25_index(index_dir)
+        from src.config import RETRIEVAL_MODE, HOVER_DENSE_INDEX_DIR
+        _dense_dir = dense_index_dir or HOVER_DENSE_INDEX_DIR
+
+        if RETRIEVAL_MODE in ("BM25", "HYBRID"):
+            bm25, bm25_doc_ids, sentences_store = load_bm25_index(index_dir)
+        if RETRIEVAL_MODE == "DENSE":
+            faiss_index, doc_ids, sentences_store = load_dense_index(_dense_dir)
+        elif RETRIEVAL_MODE == "HYBRID":
+            faiss_index, dense_doc_ids, _ = load_dense_index(_dense_dir)
         model = get_st_model()
 
         # 规范化：空格 → 下划线，首字母大写保留
@@ -857,9 +1077,27 @@ def retrieve_evidence_local_hop(
             top_idx    = torch.topk(scores, k=min(top_k, len(texts))).indices.tolist()
             return "\n".join(f"• {texts[i]}" for i in top_idx)
 
-        # 未精确命中：BM25 回退，用 article_title 作为查询词
-        query_tokens = _tokenize(article_title)
-        top_doc_ids  = bm25.get_top_n(query_tokens, doc_ids, n=3)
+        # 未精确命中：回退检索，用 article_title 作为查询词
+        import numpy as np
+        if RETRIEVAL_MODE in ("DENSE", "HYBRID"):
+            q_vec      = model.encode(
+                [article_title], convert_to_numpy=True, normalize_embeddings=True,
+            ).astype(np.float32)
+            _d_ids     = doc_ids if RETRIEVAL_MODE == "DENSE" else dense_doc_ids
+            _, indices = faiss_index.search(q_vec, min(3, len(_d_ids)))
+            dense_fb   = [_d_ids[i] for i in indices[0].tolist() if i >= 0]
+
+        if RETRIEVAL_MODE == "BM25":
+            query_tokens = _tokenize(article_title)
+            top_doc_ids  = bm25.get_top_n(query_tokens, bm25_doc_ids, n=3)
+        elif RETRIEVAL_MODE == "DENSE":
+            top_doc_ids = dense_fb
+        else:  # HYBRID
+            query_tokens = _tokenize(article_title)
+            bm25_fb      = bm25.get_top_n(query_tokens, bm25_doc_ids, n=3)
+            seen         = set(bm25_fb)
+            top_doc_ids  = bm25_fb + [d for d in dense_fb if d not in seen]
+
         if not top_doc_ids:
             return f"ERROR: 找不到与 '{article_title}' 相关的页面"
 
