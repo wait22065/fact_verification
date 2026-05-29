@@ -153,23 +153,148 @@ Final Label: <SUPPORTS | REFUTES | NOT ENOUGH INFO>"""
 
 
 def build_llm_judge_prompt(claim, evidence):
-    """【步骤3】大模型作为法官，直接判断一致性"""
-    prompt = f"""You are an objective LLM-as-a-Judge evaluating a fact-checking task.
-
-Is the claim consistent with the evidence?
+    """基础核验 prompt：基于证据判断声明真伪，仅输出 SUPPORTS/REFUTES（与 HoVer 二分类标签对齐）。"""
+    return f"""You are evaluating whether a claim is consistent with the provided evidence.
 
 Claim: {claim}
 
 Evidence:
 {evidence}
 
-Instructions: 
+Instructions:
 Based ONLY on the evidence above, determine if the claim is supported or refuted.
-Please output your final conclusion on a new line exactly as follows:
-Final Label: SUPPORTS 或 REFUTES 或 NOT ENOUGH INFO
+1. Directional equivalence: "A is X [higher/older/longer] than B" is the same as "B is X [lower/younger/shorter] than A". Reason through such equivalences explicitly before comparing with the claim.
+2. Numerical relationships (age differences, year gaps, height differences): compute the result explicitly before comparing with the claim.
+3. Output ONLY 'SUPPORTS' or 'REFUTES'. Do NOT output 'NOT ENOUGH INFO'.
+
+Final Label: SUPPORTS or REFUTES
 
 Analysis:"""
-    return prompt
+
+
+def build_ircot_hop_prompt(claim, observations, already_searched, is_first_hop=False, force_new_direction=False):
+    """
+    IRCoT 单步 prompt：每调用一次，LLM 输出一句推理 + 下一个搜索词（或 Done）。
+
+    输出格式（严格，无 Markdown）：
+      Thought: [一句推理]
+      Action: Search[Wikipedia article title]
+    或（hop1+ 可用）：
+      Thought: [一句推理]
+      Action: Done
+    """
+    obs_section = ""
+    if observations:
+        obs_section = f"\nEvidence collected so far:\n{observations}\n"
+
+    searched_section = ""
+    if already_searched:
+        titles = ", ".join(f'"{t}"' for t in already_searched)
+        searched_section = f"\nAlready searched (do NOT repeat): {titles}\n"
+
+    done_line = (
+        "" if is_first_hop
+        else "\n  Action: Done   (if evidence is already sufficient to judge the claim)"
+    )
+
+    few_shot = """\
+The following is a complete 3-step example showing how to handle one claim from start to finish.
+
+Claim: "The largest lake in New Hampshire sits nine vertical feet lower than Lake Kanasatka."
+
+--- Step 1: no evidence yet ---
+
+Thought: The claim compares elevations, so I should first find Lake Kanasatka's elevation.
+Action: Search[Lake Kanasatka]
+
+--- Step 2: after searching Lake Kanasatka ---
+
+Evidence collected so far:
+[Hop 1: Lake Kanasatka]
+• Lake Kanasatka is a 358-acre lake in Carroll County, New Hampshire, located one-half mile north of and nine vertical feet higher than Lake Winnipesaukee.
+
+Already searched: "Lake Kanasatka"
+
+Thought: The evidence directly states Kanasatka is nine vertical feet higher than Winnipesaukee, and Winnipesaukee is the largest lake in New Hampshire — this is enough to judge the claim.
+Action: Done
+
+---
+"""
+
+    direction_warning = ""
+    if force_new_direction:
+        direction_warning = (
+            "\nMANDATORY DIRECTION CHANGE: Your last two searches share the same core words and "
+            "returned the same document. You MUST search for a COMPLETELY DIFFERENT entity — "
+            "one that shares NO main words with your previous queries. "
+            "Specifically: do NOT append suffixes like 'cast', 'list', 'actors', 'year', or 'film' "
+            "to a term you have already searched. Instead, pick a DIFFERENT entity from the claim "
+            "(e.g., a person's full name, a character's name, a show or song title not yet searched).\n"
+        )
+
+    return (
+        f"You are verifying a multi-hop claim step by step using Wikipedia searches.\n"
+        f"Study the examples below, then output your next step in the exact same format.\n\n"
+        f"{few_shot}"
+        f"Now handle this claim:\n"
+        f'Claim: "{claim}"\n'
+        f"{obs_section}"
+        f"{searched_section}"
+        f"{direction_warning}\n"
+        f"Output exactly two lines (no markdown, no asterisks, no bold):\n"
+        f"  Thought: [one sentence about what you need to find next]\n"
+        f"  Action: Search[Wikipedia article title, 2-5 words]"
+        f"{done_line}\n\n"
+        f"Your response:"
+    )
+
+
+def parse_ircot_action(response):
+    """
+    解析 IRCoT 单步输出，返回 ('search', title) 或 ('done', None)。
+    优先匹配 Action: Search[...] 格式，其次匹配 Action: Done。
+    兜底：尝试从响应文本中提取搜索词，避免因格式偏差丢失一整跳。
+    """
+    if not response:
+        return ('done', None)
+
+    m_search = re.search(r'Action:\s*Search\[([^\]]+)\]', response, re.IGNORECASE)
+    if m_search:
+        return ('search', m_search.group(1).strip().strip("'\""))
+
+    if re.search(r'Action:\s*Done', response, re.IGNORECASE):
+        return ('done', None)
+
+    # 兜底：寻找 Search: / search for / look up 等自由文本表达
+    m_fallback = re.search(
+        r'(?:search(?:\s+for)?|look\s+up)[:\s]+["\']?([A-Z][^\n"\']{2,60})["\']?',
+        response, re.IGNORECASE
+    )
+    if m_fallback:
+        return ('search', m_fallback.group(1).strip())
+
+    return ('done', None)
+
+
+def build_judge_review_prompt(claim, evidence, initial_label):
+    """LLM Judge 二次核验 prompt：对基础核验的初步判断进行再审，可纠正错误标签。"""
+    return f"""You are an impartial LLM Judge reviewing a fact-checking decision.
+
+Claim: {claim}
+
+Evidence:
+{evidence}
+
+Initial Verdict: {initial_label}
+
+Strictly review the initial verdict against the evidence above.
+- If the evidence contains numerical or directional relationships, verify the reasoning before deciding.
+- Correct the verdict only if the evidence clearly contradicts it.
+Output ONLY 'SUPPORTS' or 'REFUTES'.
+
+Final Label: SUPPORTS or REFUTES
+
+Review:"""
 
 
 # ==========================================

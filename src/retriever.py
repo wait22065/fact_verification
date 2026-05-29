@@ -53,6 +53,8 @@ from src.config import (
     SBERT_TOP_K_SENTENCES,
     MAX_SENTENCES_PER_DOC,
     SBERT_MODEL_NAME,
+    CE_MODEL_NAME,
+    USE_CROSS_ENCODER,
 )
 
 # ---------------------------------------------------------------------------
@@ -85,6 +87,8 @@ except LookupError:
 # Sentence-BERT 单例
 # ---------------------------------------------------------------------------
 _ST_MODEL: Optional[SentenceTransformer] = None
+_CE_MODEL = None  # CrossEncoder，懒加载
+
 
 def get_st_model() -> SentenceTransformer:
     """
@@ -98,12 +102,45 @@ def get_st_model() -> SentenceTransformer:
         logger.info("Sentence-BERT 模型加载完成")
     return _ST_MODEL
 
+
+def get_ce_model():
+    """懒加载 Cross-Encoder 精排模型，全进程只加载一次。"""
+    global _CE_MODEL
+    if _CE_MODEL is None:
+        from sentence_transformers import CrossEncoder
+        logger.info(f"正在加载 Cross-Encoder 模型 ({CE_MODEL_NAME})...")
+        _CE_MODEL = CrossEncoder(CE_MODEL_NAME)
+        logger.info("Cross-Encoder 模型加载完成")
+    return _CE_MODEL
+
+
+def _extract_infobox(page) -> list:
+    """从 Wikipedia 页面提取 Infobox 键值对，返回文本行列表。"""
+    try:
+        from bs4 import BeautifulSoup
+        soup    = BeautifulSoup(page.html(), 'html.parser')
+        infobox = soup.find('table', class_=lambda c: c and 'infobox' in c)
+        if not infobox:
+            return []
+        lines = []
+        for row in infobox.find_all('tr'):
+            cells = row.find_all(['th', 'td'])
+            if len(cells) >= 2:
+                key = cells[0].get_text(separator=' ', strip=True)
+                val = cells[1].get_text(separator=', ', strip=True)
+                if key and val and len(val) < 200:
+                    lines.append(f"[Infobox] {key}: {val}")
+        return lines
+    except ImportError:
+        logger.warning("BeautifulSoup 未安装，Infobox 提取跳过。请运行: pip install beautifulsoup4")
+        return []
+    except Exception:
+        return []
+
 # ---------------------------------------------------------------------------
-# BM25 相关单例（三个对象绑定在一起，由 load_bm25_index 统一写入）
+# BM25 相关缓存（按 index_dir 键分开缓存，支持 FEVER 和 HoVer 两个索引并存）
 # ---------------------------------------------------------------------------
-_BM25_INDEX:      Optional[BM25Okapi] = None
-_BM25_DOC_IDS:    Optional[list]      = None
-_SENTENCES_STORE: Optional[dict]      = None  # {doc_id: {sent_id: text}}
+_BM25_CACHE: dict = {}  # {index_dir: (bm25, doc_ids, sentences_store)}
 
 # ---------------------------------------------------------------------------
 # 内部工具函数
@@ -130,8 +167,9 @@ def _parse_lines_field(lines_str: str) -> dict:
       "0\t句子0\n1\t句子1\n2\t"
 
     注意：
-      - split("\t", 1) 最多分割一次，防止句子本身含制表符被截断
-      - 空句子（\t 后面没有内容）直接跳过
+      - dump lines 格式为 "id\t句子文本\t链接词1\t链接目标1\t..."，只取前两列
+      - 第0列为句子编号，第1列为纯句子文本，之后的列是 Wikipedia 超链接标注（噪声）
+      - 空句子直接跳过
       - 句子编号从 0 开始，与 FEVER evidence 的 sentence_id 对应
     """
     result = {}
@@ -139,11 +177,12 @@ def _parse_lines_field(lines_str: str) -> dict:
         line = line.strip()
         if not line:
             continue
-        parts = line.split("\t", 1)
+        parts = line.split("\t")
         if len(parts) < 2:
             continue
-        sent_id_str, sent_text = parts
-        sent_text = _clean_text(sent_text)
+        sent_id_str = parts[0]
+        sent_text   = parts[1]  # 只取句子文本，丢弃后续的超链接标注列
+        sent_text   = _clean_text(sent_text)
         if not sent_text:
             continue
         try:
@@ -470,24 +509,159 @@ def build_bm25_index_filtered(
 
 
 # ---------------------------------------------------------------------------
+# HoVer 专用索引构建：读取 supporting_facts 字段提取目标页面
+# ---------------------------------------------------------------------------
+
+def build_bm25_index_hover(
+    dump_dir:  str = DUMP_DIR,
+    index_dir: str = None,
+    data_file: str = "data/cache/hover_dev.json",
+) -> None:
+    """
+    为 HoVer 数据集构建 BM25 索引，逻辑与 build_bm25_index_filtered 相同，
+    区别在于从 HoVer 的 supporting_facts 字段读取目标页面名而非 FEVER 的 evidence_pages。
+
+    索引默认保存到 config.HOVER_INDEX_DIR（data/hover_bm25_index/）。
+    """
+    from src.config import HOVER_INDEX_DIR
+    if index_dir is None:
+        index_dir = HOVER_INDEX_DIR
+
+    if not os.path.exists(data_file):
+        raise FileNotFoundError(
+            f"找不到 HoVer 数据文件：{data_file}\n"
+            "请确认已将 hover_dev_release_v1.1.json 重命名为 hover_dev.json "
+            "并放置到 data/cache/ 目录。"
+        )
+
+    print(f"从 HoVer 数据文件提取目标页面：{data_file}")
+    with open(data_file, 'r', encoding='utf-8') as f:
+        raw_data = json.load(f)
+
+    target_pages: set = set()
+    for item in raw_data:
+        for fact in item.get('supporting_facts', []):
+            if fact and len(fact) >= 1:
+                page = str(fact[0]).replace(' ', '_')
+                if page:
+                    target_pages.add(page)
+
+    print(f"HoVer 数据集共 {len(raw_data)} 条 claim，"
+          f"涉及 {len(target_pages)} 个不重复 Wikipedia 页面。")
+
+    if not target_pages:
+        raise ValueError(
+            "未从 HoVer 数据中读取到任何 supporting_facts 页面。\n"
+            "请确认数据文件格式正确（每条 claim 有 supporting_facts 字段）。"
+        )
+
+    # 以下逻辑与 build_bm25_index_filtered 完全一致
+    Path(index_dir).mkdir(parents=True, exist_ok=True)
+    doc_ids_path   = os.path.join(index_dir, "doc_ids.pkl")
+    sentences_path = os.path.join(index_dir, "sentences.pkl")
+    bm25_path      = os.path.join(index_dir, "bm25.pkl")
+
+    if all(os.path.exists(p) for p in [doc_ids_path, sentences_path, bm25_path]):
+        print(f"HoVer BM25 索引已存在于 {index_dir}，跳过构建。")
+        print("如需重建，请手动删除该目录后再运行。")
+        return
+
+    jsonl_files = sorted(glob.glob(os.path.join(dump_dir, "wiki-*.jsonl")))
+    if not jsonl_files:
+        raise FileNotFoundError(
+            f"在 {dump_dir} 下未找到 wiki-*.jsonl 文件。"
+        )
+
+    print(f"找到 {len(jsonl_files)} 个 jsonl 文件，开始扫描（只加载目标页面）...")
+
+    doc_ids          = []
+    tokenized_corpus = []
+    sentences_store  = {}
+    total_docs  = 0
+    skipped     = 0
+    found_pages = set()
+
+    for file_idx, jsonl_path in enumerate(jsonl_files):
+        if (file_idx + 1) % 10 == 0 or file_idx == 0:
+            print(f"  扫描中：{os.path.basename(jsonl_path)} "
+                  f"({file_idx + 1}/{len(jsonl_files)})，"
+                  f"已找到 {len(found_pages)}/{len(target_pages)} 个目标页面...")
+
+        if found_pages == target_pages:
+            print("  所有目标页面已找到，提前结束扫描。")
+            break
+
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            for raw_line in f:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    skipped += 1
+                    continue
+
+                doc_id = record.get("id",    "").strip()
+                text   = record.get("text",  "").strip()
+                lines  = record.get("lines", "").strip()
+
+                if doc_id not in target_pages:
+                    continue
+                if not doc_id or not text:
+                    skipped += 1
+                    continue
+
+                sent_dict = _parse_lines_field(lines)
+                if not sent_dict:
+                    sent_dict = {0: _clean_text(text)}
+
+                sentences_store[doc_id] = sent_dict
+
+                tokens = _tokenize(_clean_text(text))
+                if not tokens:
+                    skipped += 1
+                    continue
+
+                doc_ids.append(doc_id)
+                tokenized_corpus.append(tokens)
+                found_pages.add(doc_id)
+                total_docs += 1
+
+    missing_pages = target_pages - found_pages
+    print(f"\n扫描完成：目标 {len(target_pages)} 页，"
+          f"成功加载 {total_docs} 篇，未找到 {len(missing_pages)} 个。")
+    if missing_pages and len(missing_pages) <= 20:
+        print(f"  未找到的页面：{sorted(missing_pages)}")
+
+    if total_docs == 0:
+        raise RuntimeError("未能加载任何文档，请检查 dump_dir 路径和文件完整性。")
+
+    print(f"\n正在构建 BM25Okapi 索引（{total_docs} 篇文档）...")
+    bm25 = BM25Okapi(tokenized_corpus)
+
+    print("正在持久化到磁盘...")
+    with open(doc_ids_path,   'wb') as f: pickle.dump(doc_ids,          f)
+    with open(sentences_path, 'wb') as f: pickle.dump(sentences_store,  f)
+    with open(bm25_path,      'wb') as f: pickle.dump(bm25,             f)
+    print(f"\nHoVer BM25 索引构建完成！文件存放于：{index_dir}")
+
+
+# ---------------------------------------------------------------------------
 # 索引加载（进程内单例，只加载一次）
 # ---------------------------------------------------------------------------
 
 def load_bm25_index(index_dir: str = INDEX_DIR):
     """
     加载持久化的 BM25 索引到内存。
-    全进程单例：第一次调用时从磁盘加载，后续调用直接返回缓存对象。
+    按 index_dir 分别缓存，支持 FEVER 和 HoVer 两个索引在同一进程中并存。
 
-    返回：
-      (bm25, doc_ids, sentences_store)
-        bm25:            BM25Okapi 对象
-        doc_ids:         文档 id 列表（顺序与 bm25 内部对齐）
-        sentences_store: {doc_id: {sent_id: text}}
+    返回：(bm25, doc_ids, sentences_store)
     """
-    global _BM25_INDEX, _BM25_DOC_IDS, _SENTENCES_STORE
+    global _BM25_CACHE
 
-    if _BM25_INDEX is not None:
-        return _BM25_INDEX, _BM25_DOC_IDS, _SENTENCES_STORE
+    if index_dir in _BM25_CACHE:
+        return _BM25_CACHE[index_dir]
 
     doc_ids_path   = os.path.join(index_dir, "doc_ids.pkl")
     sentences_path = os.path.join(index_dir, "sentences.pkl")
@@ -497,27 +671,21 @@ def load_bm25_index(index_dir: str = INDEX_DIR):
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"找不到索引文件：{path}\n"
-                "请先运行 build_bm25_index_filtered() 构建索引。\n"
-                "示例：from src.retriever import build_bm25_index_filtered; "
-                "build_bm25_index_filtered()"
+                "FEVER 索引：from src.retriever import build_bm25_index_filtered; "
+                "build_bm25_index_filtered()\n"
+                "HoVer 索引：from src.retriever import build_bm25_index_hover; "
+                "build_bm25_index_hover()"
             )
 
-    print("正在加载 BM25 索引到内存（首次加载约需数十秒）...")
+    print(f"正在加载 BM25 索引（{index_dir}）...")
 
-    with open(doc_ids_path, 'rb') as f:
-        _BM25_DOC_IDS = pickle.load(f)
-    print(f"  doc_ids 加载完成：{len(_BM25_DOC_IDS)} 篇文档")
+    with open(doc_ids_path,   'rb') as f: doc_ids         = pickle.load(f)
+    with open(sentences_path, 'rb') as f: sentences_store = pickle.load(f)
+    with open(bm25_path,      'rb') as f: bm25            = pickle.load(f)
 
-    with open(sentences_path, 'rb') as f:
-        _SENTENCES_STORE = pickle.load(f)
-    print("  sentences 加载完成")
-
-    with open(bm25_path, 'rb') as f:
-        _BM25_INDEX = pickle.load(f)
-    print("  BM25 对象加载完成")
-
-    print("索引加载完毕，可以开始检索。")
-    return _BM25_INDEX, _BM25_DOC_IDS, _SENTENCES_STORE
+    print(f"  加载完成：{len(doc_ids)} 篇文档")
+    _BM25_CACHE[index_dir] = (bm25, doc_ids, sentences_store)
+    return bm25, doc_ids, sentences_store
 
 
 # ---------------------------------------------------------------------------
@@ -636,40 +804,171 @@ def retrieve_evidence_from_dump(
 
 
 # ---------------------------------------------------------------------------
+# IRCoT 多跳专用：按词条标题检索本地 dump
+# ---------------------------------------------------------------------------
+
+def retrieve_evidence_local_hop(
+    article_title: str,
+    claim: str,
+    top_k: int = 2,
+    index_dir: str = INDEX_DIR,
+) -> str:
+    """
+    从本地 dump 检索指定 Wikipedia 文章中与 claim 最相关的句子。
+    供 IRCoT 多跳循环的每一跳调用，每跳只针对一个词条。
+
+    策略：
+      1. 将 article_title 规范化（空格→下划线）后在 sentences_store 里精确查找
+      2. 精确命中：对该文章所有句子用 SBERT 按 claim 排序，返回 top_k 句
+      3. 未精确命中：用 article_title 做 BM25 全库检索（top-3 文档），再 SBERT 排序
+    """
+    try:
+        bm25, doc_ids, sentences_store = load_bm25_index(index_dir)
+        model = get_st_model()
+
+        # 规范化：空格 → 下划线，首字母大写保留
+        normalized = article_title.strip().replace(' ', '_')
+
+        # 精确查找（大小写不敏感）
+        matched_id = None
+        normalized_lower = normalized.lower()
+        for doc_id in sentences_store:
+            if doc_id.lower() == normalized_lower:
+                matched_id = doc_id
+                break
+
+        if matched_id:
+            sent_dict  = sentences_store[matched_id]
+            texts      = [t for t in sent_dict.values() if len(t) >= 15]
+            if not texts:
+                return f"ERROR: 文章 '{article_title}' 存在但无有效句子"
+
+            claim_emb  = model.encode(claim, convert_to_tensor=True)
+            corpus_emb = model.encode(texts, convert_to_tensor=True)
+            scores     = util.cos_sim(claim_emb, corpus_emb)[0]
+            if USE_CROSS_ENCODER:
+                pre_k    = min(20, len(texts))
+                pre_idx  = torch.topk(scores, k=pre_k).indices.tolist()
+                cands    = [texts[i] for i in pre_idx]
+                ce_model = get_ce_model()
+                ce_scores = ce_model.predict([[claim, s] for s in cands])
+                ranked   = sorted(zip(ce_scores, cands), key=lambda x: x[0], reverse=True)
+                return "\n".join(f"• {s}" for _, s in ranked[:top_k])
+            top_idx    = torch.topk(scores, k=min(top_k, len(texts))).indices.tolist()
+            return "\n".join(f"• {texts[i]}" for i in top_idx)
+
+        # 未精确命中：BM25 回退，用 article_title 作为查询词
+        query_tokens = _tokenize(article_title)
+        top_doc_ids  = bm25.get_top_n(query_tokens, doc_ids, n=3)
+        if not top_doc_ids:
+            return f"ERROR: 找不到与 '{article_title}' 相关的页面"
+
+        candidate_texts = []
+        for doc_id in top_doc_ids:
+            sent_dict = sentences_store.get(doc_id, {})
+            for sid in sorted(sent_dict)[:MAX_SENTENCES_PER_DOC]:
+                text = sent_dict[sid]
+                if len(text) >= 15:
+                    candidate_texts.append(text)
+
+        if not candidate_texts:
+            return f"ERROR: 找不到与 '{article_title}' 相关的页面"
+
+        claim_emb  = model.encode(claim,           convert_to_tensor=True)
+        corpus_emb = model.encode(candidate_texts, convert_to_tensor=True)
+        scores     = util.cos_sim(claim_emb, corpus_emb)[0]
+        if USE_CROSS_ENCODER:
+            pre_k    = min(20, len(candidate_texts))
+            pre_idx  = torch.topk(scores, k=pre_k).indices.tolist()
+            cands    = [candidate_texts[i] for i in pre_idx]
+            ce_model = get_ce_model()
+            ce_scores = ce_model.predict([[claim, s] for s in cands])
+            ranked   = sorted(zip(ce_scores, cands), key=lambda x: x[0], reverse=True)
+            return "\n".join(f"• {s}" for _, s in ranked[:top_k])
+        top_idx    = torch.topk(scores, k=min(top_k, len(candidate_texts))).indices.tolist()
+        return "\n".join(f"• {candidate_texts[i]}" for i in top_idx)
+
+    except FileNotFoundError as e:
+        return f"RETRIEVAL_ERROR: 索引未找到。{e}"
+    except Exception as e:
+        logger.exception("retrieve_evidence_local_hop 发生异常")
+        return f"RETRIEVAL_ERROR: {e}"
+
+
+# ---------------------------------------------------------------------------
 # 以下为原有函数，保留不动
 # ---------------------------------------------------------------------------
 
-def retrieve_evidence_pipeline(claim, entity_query, top_k_sentences=3):
+def retrieve_evidence_pipeline(claim, entity_queries, top_k_sentences=3):
     """
-    原有方案：实时调用 Wikipedia API + Sentence-BERT。
-    用于 EXTENDED_PIPELINE 模式，不依赖本地 dump。
+    改进版多跳检索流水线，支持四种可选增强（由 config 开关控制）：
+      USE_MULTI_HOP     - entity_queries 为实体列表时逐一检索（由 verifier 控制传参）
+      USE_INFOBOX       - 额外提取每个页面的 Infobox 结构化数据加入候选
+      USE_HYBRID_BM25   - SBERT 精排之前先用 BM25 对候选句做初筛（top-30）
+      USE_CROSS_ENCODER - SBERT 粗排（top-20）后用 Cross-Encoder 精排
     """
-    try:
-        search_results = wikipedia.search(entity_query, results=3)
-        if not search_results:
-            return f"ERROR: 找不到关键词 '{entity_query}' 相关的页面"
+    # 兼容字符串输入（向后兼容）
+    if isinstance(entity_queries, str):
+        entity_queries = [entity_queries]
 
+    try:
         all_sentences = []
-        for title in search_results:
-            try:
-                content = wikipedia.page(title, auto_suggest=False).content
-                sentences = nltk.sent_tokenize(content)
-                clean_sentences = [s.strip() for s in sentences if len(s) > 20][:30]
-                all_sentences.extend(clean_sentences)
-            except Exception:
+        seen_titles   = set()
+
+        # -------------------------------------------------------
+        # Step 1: 对每个实体查询，独立搜索 Wikipedia
+        # -------------------------------------------------------
+        for entity_query in entity_queries:
+            search_results = wikipedia.search(entity_query, results=3)
+            if not search_results:
                 continue
 
+            for title in search_results:
+                if title in seen_titles:
+                    continue
+                seen_titles.add(title)
+
+                try:
+                    page = wikipedia.page(title, auto_suggest=False)
+                    sentences = nltk.sent_tokenize(page.content)
+                    clean     = [s.strip() for s in sentences if len(s) > 20][:30]
+                    all_sentences.extend(clean)
+                except Exception:
+                    continue
+
         if not all_sentences:
-            return "ERROR: 无法从页面提取有效内容。"
+            return f"ERROR: 找不到关键词 '{', '.join(entity_queries)}' 相关的页面"
 
-        model             = get_st_model()
-        claim_embedding   = model.encode(claim,         convert_to_tensor=True)
-        corpus_embeddings = model.encode(all_sentences, convert_to_tensor=True)
+        # 去重，保留首次出现顺序
+        seen, unique = set(), []
+        for s in all_sentences:
+            if s not in seen:
+                seen.add(s)
+                unique.append(s)
+        all_sentences = unique
 
-        cos_scores  = util.cos_sim(claim_embedding, corpus_embeddings)[0]
-        top_results = torch.topk(cos_scores, k=min(top_k_sentences, len(all_sentences)))
+        # -------------------------------------------------------
+        # Step 2: SBERT bi-encoder 粗排 + 可选 Cross-Encoder 精排
+        # -------------------------------------------------------
+        model      = get_st_model()
+        claim_emb  = model.encode(claim,         convert_to_tensor=True)
+        corpus_emb = model.encode(all_sentences, convert_to_tensor=True)
+        cos_scores = util.cos_sim(claim_emb, corpus_emb)[0]
 
-        evidence_chain = [all_sentences[idx] for idx in top_results[1]]
+        if USE_CROSS_ENCODER:
+            # SBERT 粗排取 top-20，再用 Cross-Encoder 精排
+            pre_k      = min(20, len(all_sentences))
+            pre_idx    = torch.topk(cos_scores, k=pre_k).indices.tolist()
+            candidates = [all_sentences[i] for i in pre_idx]
+
+            ce_model       = get_ce_model()
+            ce_scores      = ce_model.predict([[claim, s] for s in candidates])
+            ranked         = sorted(zip(ce_scores, candidates), key=lambda x: x[0], reverse=True)
+            evidence_chain = [s for _, s in ranked[:top_k_sentences]]
+        else:
+            top_results    = torch.topk(cos_scores, k=min(top_k_sentences, len(all_sentences)))
+            evidence_chain = [all_sentences[idx] for idx in top_results.indices.tolist()]
+
         return "\n".join([f"• {s}" for s in evidence_chain])
 
     except Exception as e:

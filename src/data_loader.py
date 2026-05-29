@@ -29,10 +29,21 @@ def load_hover_data(sample_size=50, seed=42):
     for item in raw_data:
         original_label = item.get('label', '')
         label = "SUPPORTS" if original_label == "SUPPORTED" else "REFUTES"
+
+        # 提取 supporting_facts 中的页面名，空格转下划线与 dump id 格式对应
+        seen, pages = set(), []
+        for fact in item.get('supporting_facts', []):
+            if fact and len(fact) >= 1:
+                page = str(fact[0]).replace(' ', '_')
+                if page and page not in seen:
+                    seen.add(page)
+                    pages.append(page)
+
         data_list.append({
-            'id': f"hover_{item.get('uid', 'unknown')}",
-            'claim': item.get('claim', ''),
-            'label': label
+            'id':            f"hover_{item.get('uid', 'unknown')}",
+            'claim':         item.get('claim', ''),
+            'label':         label,
+            'evidence_pages': pages,
         })
 
     random.seed(seed)
