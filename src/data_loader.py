@@ -12,51 +12,123 @@ RAW_JSONL_FILE = os.path.join(BASE_DIR, "data", "shared_task_dev.jsonl")
 
 
 def load_hover_data(sample_size=50, seed=42):
-    """读取 HoVer 官方 Dev 集文件，提取多条 supporting_facts 页面名"""
+    """
+    读取 HoVer 官方 Dev 集文件，并进行二分类均衡采样。
 
-    file_path = "data/cache/hover_dev.json"
+    HoVer 原始标签可能是：
+      SUPPORTED / REFUTED
+      或 SUPPORTS / REFUTES
+      或 NOT_SUPPORTED
+
+    统一映射为：
+      SUPPORTS / REFUTES
+    """
+    file_path = os.path.join(BASE_DIR, "data", "cache", "hover_dev.json")
 
     if not os.path.exists(file_path):
         print(f"错误：找不到文件 {file_path}")
-        print("请确认你已经下载了 Dev set 并重命名放在了 data/cache/ 目录下。")
+        print("请确认你已经下载 HoVer Dev set，并重命名为 hover_dev.json 放到 data/cache/ 目录下。")
         return []
 
     print(f"正在读取 HoVer 数据: {file_path}")
-    with open(file_path, 'r', encoding='utf-8') as f:
+
+    with open(file_path, "r", encoding="utf-8") as f:
         raw_data = json.load(f)
 
     data_list = []
-    for item in raw_data:
-        # 【改动1】统一 label 映射
-        original_label = item.get('label', '')
+    raw_label_counter = {}
 
-        if original_label == "SUPPORTED":
+    for item in raw_data:
+        original_label = str(item.get("label", "")).strip()
+        label_upper = original_label.upper()
+
+        raw_label_counter[label_upper] = raw_label_counter.get(label_upper, 0) + 1
+
+        # 统一标签映射
+        if label_upper in ["SUPPORTED", "SUPPORTS"]:
             label = "SUPPORTS"
-        elif original_label == "REFUTED":
+        elif label_upper in ["REFUTED", "REFUTES", "NOT_SUPPORTED", "NOT SUPPORTS", "NOT-SUPPORTED"]:
             label = "REFUTES"
         else:
+            # 遇到未知标签，跳过，避免污染评估
             continue
 
-        # 【改动2】提取 supporting_facts 页面名，去重、下划线转换
+        # 提取 supporting_facts 页面名，空格转下划线，与 wiki dump id 对齐
         seen, pages = set(), []
-        for fact in item.get('supporting_facts', []):
+
+        for fact in item.get("supporting_facts", []):
             if fact and len(fact) >= 1:
-                page = str(fact[0]).replace(' ', '_')
+                page = str(fact[0]).replace(" ", "_")
                 if page and page not in seen:
                     seen.add(page)
                     pages.append(page)
 
         data_list.append({
-            'id': f"hover_{item.get('uid', 'unknown')}",
-            'claim': item.get('claim', ''),
-            'label': label,
-            'evidence_pages': pages,  # 【改动3】用于 RAG 检索
+            "id": f"hover_{item.get('uid', item.get('id', 'unknown'))}",
+            "claim": item.get("claim", ""),
+            "label": label,
+            "evidence_pages": pages,
         })
 
-    # 【改动4】安全随机采样
-    random.seed(seed)
-    sampled_data = random.sample(data_list, min(sample_size, len(data_list)))
+    print("HoVer 原始标签分布：")
+    for label, count in raw_label_counter.items():
+        print(f"  {label}: {count} 条")
+
+    supports = [item for item in data_list if item["label"] == "SUPPORTS"]
+    refutes = [item for item in data_list if item["label"] == "REFUTES"]
+
+    print("HoVer 映射后标签分布：")
+    print(f"  SUPPORTS: {len(supports)} 条")
+    print(f"  REFUTES: {len(refutes)} 条")
+
+    if not supports or not refutes:
+        print("警告：HoVer 数据中某一类为空，请检查 hover_dev.json 是否完整，或 label 字段格式是否不同。")
+
+    rng = random.Random(seed)
+
+    if sample_size < len(data_list):
+        # 二分类均衡采样
+        half = sample_size // 2
+
+        sampled_supports = rng.sample(
+            supports,
+            min(half, len(supports))
+        )
+
+        sampled_refutes = rng.sample(
+            refutes,
+            min(sample_size - len(sampled_supports), len(refutes))
+        )
+
+        sampled_data = sampled_supports + sampled_refutes
+
+        # 如果某一类不足，用剩余样本补齐
+        remaining = sample_size - len(sampled_data)
+
+        if remaining > 0:
+            used_ids = {item["id"] for item in sampled_data}
+            leftovers = [
+                item for item in data_list
+                if item["id"] not in used_ids
+            ]
+
+            sampled_extra = rng.sample(
+                leftovers,
+                min(remaining, len(leftovers))
+            )
+
+            sampled_data.extend(sampled_extra)
+
+        rng.shuffle(sampled_data)
+
+    else:
+        sampled_data = data_list
+        rng.shuffle(sampled_data)
+
     print(f"成功加载 {len(sampled_data)} 条 HoVer 真实数据！")
+    print(f"  SUPPORTS: {sum(1 for item in sampled_data if item['label'] == 'SUPPORTS')} 条")
+    print(f"  REFUTES: {sum(1 for item in sampled_data if item['label'] == 'REFUTES')} 条")
+
     return sampled_data
 
 
