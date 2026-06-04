@@ -1,59 +1,39 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# 虚拟环境
+# virtual env
+.venv/
 venv/
 env/
-ENV/
 
-# 环境变量（包含API密钥）
+# secrets
 .env
 
-# 日志
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# logs
 logs/
 *.log
 
-# 数据缓存
-data/cache/
-.cache/
+# data and cache
+data/
+data.zip
 
-# FEVER数据集本地缓存（文件较大，不提交）
-data/fever_*.json
+# local models
+local_models/
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
+# generated zip files
+src.zip
 
-# 操作系统
+# model / index files
+*.pkl
+*.bin
+*.safetensors
+*.h5
+*.ot
+*.onnx
+
+# system / editor
 .DS_Store
 Thumbs.db
-
-# Hugging Face缓存
-.huggingface/
-
-# 结果文件（可选择性提交）
-data/results/
-
-# Claude相关
-.claude/
+.vscode/

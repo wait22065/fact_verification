@@ -1,314 +1,672 @@
-# FEVER事实验证系统
+# FEVER / HoVer Fact Verification System
 
-基于FEVER数据集的事实验证系统，用于评估大模型在事实核查任务上的表现。
+本项目是一个基于大语言模型的事实验证系统，主要面向 FEVER 数据集，并扩展支持 HoVer 多跳事实验证任务。系统能够输入一条自然语言声明，结合不同实验模式输出事实验证标签：
 
-## 项目简介
+* `SUPPORTS`
+* `REFUTES`
+* `NOT ENOUGH INFO`
 
-本项目实现了两个任务：
+项目实现了 Baseline、CoT、RAG、RAG_COT、BM25+SBERT、BM25+SBERT+CrossEncoder、Gold Evidence 对照组，以及 HoVer 多跳扩展流程。
 
-- **任务一（当前）：Baseline** - 不使用证据，只基于claim让模型判断事实正确性
-- **任务二（待实现）：RAG增强** - 使用检索增强，提供evidence给模型
+---
 
-## 功能特点
+## 1. 项目功能
 
-- 使用FEVER公开数据集（labelled_dev验证集，37566条）
-- 调用DeepSeek API进行事实验证
-- 支持随机采样和可复现实验
-- 首次运行自动下载并缓存数据集到本地，后续直接读取
-- 完整的评估指标（accuracy、precision、recall、F1、幻觉率）
-- 自动记录无法解析的模型响应，方便调整prompt
-- 详细的日志记录和结果保存
+本项目支持以下功能：
 
-## 安装
+1. 基于大模型内置知识的直接事实判断。
+2. 基于 Chain-of-Thought 的逐步推理事实判断。
+3. 基于 Wikipedia 证据的 RAG 事实验证。
+4. 基于 BM25 + Sentence-BERT 的自动证据选择。
+5. 基于 CrossEncoder 的证据精排。
+6. 基于 Gold Evidence 的上限对照实验。
+7. 基于 HoVer 的多跳事实验证扩展。
+8. 多轮实验与均值、标准差统计。
+9. Accuracy、Precision、Recall、F1、Hallucination Rate 等指标计算。
+10. 日志保存、结果保存、解析错误保存。
+11. 支持不同实验模式自动加载不同数据集。
+12. 支持自动检查和构建 BM25 索引。
 
-### 1. 克隆项目
+---
 
-```bash
-git clone <your-repo-url>
-cd fact_verification
+## 2. 项目结构
+
+```text
+fact_verification/
+├── main.py
+├── README.md
+├── requirements.txt
+├── .env
+├── .env.example
+├── src/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── api_client.py
+│   ├── data_loader.py
+│   ├── golden_loader.py
+│   ├── prompt_builder.py
+│   ├── retriever.py
+│   ├── verifier.py
+│   ├── evaluator.py
+│   └── utils.py
+├── data/
+│   ├── shared_task_dev.jsonl
+│   ├── wiki-pages/
+│   ├── cache/
+│   └── results/
+├── logs/
+└── local_models/
 ```
 
-### 2. 创建虚拟环境（推荐使用uv）
+---
+
+## 3. 环境安装
+
+### 3.1 创建虚拟环境
+
+推荐使用 `uv`：
 
 ```bash
-# 安装uv（如果还没安装）
-pip install uv
-
-# 创建虚拟环境
 uv venv
+```
 
-# 激活虚拟环境
-# Windows:
+Windows 激活：
+
+```bash
 .venv\Scripts\activate
+```
 
-# Linux/Mac:
+Linux / macOS 激活：
+
+```bash
 source .venv/bin/activate
 ```
 
-### 3. 安装依赖
+也可以使用普通 venv：
 
 ```bash
-# 使用uv安装（速度更快）
-uv pip install -r requirements.txt
+python -m venv .venv
+```
 
-# 或使用pip
+---
+
+### 3.2 安装依赖
+
+```bash
 pip install -r requirements.txt
 ```
 
-依赖包：
-
-- `openai` - DeepSeek API调用
-- `python-dotenv` - 环境变量管理
-- `scikit-learn` - 评估指标计算
-- `tqdm` - 进度条显示
-- `datasets` - Hugging Face数据集加载
-
-### 4. 配置API密钥
-
-复制环境变量模板：
+如果使用 Sentence-BERT 和 CrossEncoder，需要安装：
 
 ```bash
-cp .env.example .env
+pip install sentence-transformers
 ```
 
-编辑 `.env` 文件，填入你的DeepSeek API密钥：
+如果使用 tqdm、scikit-learn、dotenv 等依赖：
 
+```bash
+pip install tqdm scikit-learn python-dotenv
 ```
+
+---
+
+## 4. API Key 配置
+
+在项目根目录创建 `.env` 文件：
+
+```env
 DEEPSEEK_API_KEY=your_api_key_here
 ```
 
-## 使用方法
+系统会在 `src/config.py` 中通过：
 
-### 运行验证
+```python
+load_dotenv()
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+```
+
+读取 API Key。
+
+---
+
+## 5. 数据准备
+
+### 5.1 FEVER 数据
+
+请将 FEVER 官方 dev 文件放到：
+
+```text
+data/shared_task_dev.jsonl
+```
+
+系统首次运行时会解析该文件，并缓存为：
+
+```text
+data/fever_labelled_dev.json
+```
+
+后续运行会优先读取本地缓存。
+
+---
+
+### 5.2 Wikipedia Dump
+
+请将 FEVER Wikipedia dump 解压到：
+
+```text
+data/wiki-pages/
+```
+
+目录中应包含类似：
+
+```text
+wiki-001.jsonl
+wiki-002.jsonl
+...
+```
+
+该 dump 用于：
+
+* BM25 索引构建
+* Sentence-BERT 句子筛选
+* Gold Evidence 原句反查
+* HoVer 检索
+
+---
+
+### 5.3 HoVer 数据
+
+如果需要运行 HoVer 扩展实验，请将 HoVer dev 数据放到：
+
+```text
+data/cache/hover_dev.json
+```
+
+数据加载模块会读取其中的 `claim`、`label` 和 `supporting_facts` 字段，并将 HoVer 标签映射为系统统一标签：
+
+```text
+SUPPORTED -> SUPPORTS
+REFUTED   -> REFUTES
+```
+
+---
+
+## 6. 配置文件说明
+
+主要配置位于：
+
+```text
+src/config.py
+```
+
+### 6.1 API 配置
+
+```python
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+MODEL_NAME = "deepseek-chat"
+
+TEMPERATURE = 0.1
+MAX_TOKENS = 1024
+TIMEOUT = 90
+MAX_RETRIES = 3
+RETRY_DELAY = 5
+BACKOFF_FACTOR = 2
+REQUEST_DELAY = 1.0
+```
+
+建议事实验证任务使用较低温度：
+
+```python
+TEMPERATURE = 0.1
+```
+
+如果 API 经常连接失败，建议增大：
+
+```python
+REQUEST_DELAY = 1.0
+TIMEOUT = 90
+RETRY_DELAY = 5
+```
+
+---
+
+### 6.2 实验模式
+
+核心参数：
+
+```python
+EXPERIMENT_MODE = "RAG_GOLDEN"
+```
+
+支持以下模式：
+
+| 模式                  | 说明                                     |
+| ------------------- | -------------------------------------- |
+| `BASELINE`          | 直接使用大模型内置知识判断                          |
+| `COT`               | 无证据，使用逐步推理                             |
+| `RAG`               | 标题检索 Wikipedia 页面前几句                   |
+| `RAG_COT`           | 标题检索 + CoT                             |
+| `RAG_BM25`          | BM25 + Sentence-BERT 自动证据选择            |
+| `RAG_BM25_CE`       | BM25 + Sentence-BERT + CrossEncoder 精排 |
+| `RAG_GOLDEN`        | 使用人工 Gold Evidence                     |
+| `RAG_COT_GOLDEN`    | Gold Evidence + CoT                    |
+| `EXTENDED_PIPELINE` | HoVer 多跳事实验证扩展                         |
+
+---
+
+### 6.3 样本与轮次
+
+```python
+SAMPLE_SIZE = 50
+RANDOM_SEED = 42
+NUM_ROUNDS = 1
+```
+
+调试时建议：
+
+```python
+SAMPLE_SIZE = 5
+```
+
+正式实验建议：
+
+```python
+SAMPLE_SIZE = 50
+```
+
+如果 API 稳定，可改为：
+
+```python
+SAMPLE_SIZE = 100
+```
+
+---
+
+### 6.4 检索参数
+
+```python
+BM25_TOP_N_DOCS = 5
+SBERT_TOP_K_SENTENCES = 4
+MAX_SENTENCES_PER_DOC = 5
+SBERT_MODEL_NAME = "all-MiniLM-L6-v2"
+```
+
+含义：
+
+| 参数                      | 说明                 |
+| ----------------------- | ------------------ |
+| `BM25_TOP_N_DOCS`       | BM25 召回候选文档数量      |
+| `SBERT_TOP_K_SENTENCES` | 最终返回给 LLM 的证据句数量   |
+| `MAX_SENTENCES_PER_DOC` | 每篇文档最多取多少句参与排序     |
+| `SBERT_MODEL_NAME`      | Sentence-BERT 模型名称 |
+
+---
+
+### 6.5 CrossEncoder 参数
+
+```python
+CE_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+USE_CROSS_ENCODER = False
+CE_RERANK_TOP_N = 20
+```
+
+`RAG_BM25_CE` 模式会启用 CrossEncoder 精排，用于进一步筛选更相关的证据句。
+
+---
+
+### 6.6 Gold Evidence 参数
+
+```python
+GOLDEN_FEVER_FILE = os.path.join(BASE_DIR, "data", "shared_task_dev.jsonl")
+GOLDEN_EVIDENCE_CACHE = os.path.join(DATA_CACHE_DIR, "golden_evidence_cache.json")
+REBUILD_GOLDEN_EVIDENCE_CACHE = False
+```
+
+如果修改了 Gold Evidence 解析逻辑，第一次运行建议：
+
+```python
+REBUILD_GOLDEN_EVIDENCE_CACHE = True
+```
+
+缓存重建完成后改回：
+
+```python
+REBUILD_GOLDEN_EVIDENCE_CACHE = False
+```
+
+---
+
+### 6.7 HoVer 扩展参数
+
+```python
+HOVER_INDEX_DIR = os.path.join(DATA_CACHE_DIR, "hover_bm25_index")
+
+USE_MULTI_HOP = True
+MAX_HOP_ROUNDS = 3
+USE_LLM_JUDGE = False
+RETRIEVAL_MODE = "BM25"
+```
+
+含义：
+
+| 参数               | 说明              |
+| ---------------- | --------------- |
+| `USE_MULTI_HOP`  | 是否启用 IRCoT 多跳检索 |
+| `MAX_HOP_ROUNDS` | 最大检索跳数          |
+| `USE_LLM_JUDGE`  | 是否启用二次 Judge 复核 |
+| `RETRIEVAL_MODE` | 检索模式，默认 BM25    |
+
+---
+
+## 7. 运行方法
+
+在项目根目录运行：
 
 ```bash
 python main.py
 ```
 
-程序会自动：
+程序会自动根据 `EXPERIMENT_MODE` 执行对应实验。
 
-1. **首次运行**：从Hugging Face下载FEVER验证集并保存到 `data/fever_labelled_dev.json`
-2. **后续运行**：直接从本地JSON文件加载（速度快）
-3. 随机采样50条数据（可在`src/config.py`中配置）
-4. 调用DeepSeek API进行验证
-5. 计算评估指标
-6. 保存结果到`data/results/verification_results.json`
-7. 如有解析错误，保存到`data/results/parse_errors.json`
+---
 
-### 配置参数
+## 8. 推荐运行顺序
 
-编辑 `src/config.py` 可修改：
+### 8.1 调试阶段
+
+先用小样本跑通：
 
 ```python
-SAMPLE_SIZE = 50        # 采样数量
-RANDOM_SEED = 42        # 随机种子（固定后每次采样结果相同）
-TEMPERATURE = 0.1       # 模型温度
-MAX_RETRIES = 3         # API重试次数
+SAMPLE_SIZE = 5
+NUM_ROUNDS = 1
+REQUEST_DELAY = 1.0
 ```
 
-## 输出结果
+依次测试：
 
-### 控制台输出
-
-```
-============================================================
-FEVER事实验证系统 - 任务一：Baseline（无证据）
-============================================================
-
-2026-04-17 15:05:54 - FEVER_Verification - INFO - 步骤1: 加载FEVER数据集
-
-首次运行，从Hugging Face下载FEVER数据集 (labelled_dev)...
-数据集总数: 37566条
-数据验证完成: 37566条有效数据
-保存数据集到本地: data/fever_labelled_dev.json
-保存完成！
-随机采样: 50条 (随机种子: 42)
-
-标签分布:
-  REFUTES: 13条
-  SUPPORTS: 23条
-  NOT ENOUGH INFO: 14条
-
-2026-04-17 15:05:59 - FEVER_Verification - INFO - 步骤2: 执行事实验证
-验证进度: 100%|██████████| 50/50 [00:45<00:00,  1.11it/s]
-
-==================================================
-评估结果
-==================================================
-
-Accuracy (准确率): 0.8200
-Macro Precision (宏平均精确率): 0.7900
-Macro Recall (宏平均召回率): 0.7800
-Macro F1-Score (宏平均F1): 0.7850
-Hallucination Rate (幻觉率): 0.1500
-
-==================================================
-各类别详细指标
-==================================================
-类别                 Precision    Recall       F1-Score     Support
-----------------------------------------------------------------------
-SUPPORTS             0.8500       0.8800       0.8650       23
-REFUTES              0.8000       0.7500       0.7750       13
-NOT ENOUGH INFO      0.7300       0.7300       0.7300       14
-
-已保存 2 条解析错误到: data/results/parse_errors.json
-结果已保存到: data/results/verification_results.json
-
-============================================================
-任务完成！
-总耗时: 45.3秒
-结果文件: data/results/verification_results.json
-============================================================
+```python
+EXPERIMENT_MODE = "BASELINE"
+EXPERIMENT_MODE = "RAG_GOLDEN"
+EXPERIMENT_MODE = "RAG_BM25"
+EXPERIMENT_MODE = "RAG_BM25_CE"
+EXPERIMENT_MODE = "EXTENDED_PIPELINE"
 ```
 
-### 结果文件
+---
 
-**`data/results/verification_results.json`** - 完整验证结果：
+### 8.2 正式 FEVER 实验
+
+建议依次运行：
+
+```python
+EXPERIMENT_MODE = "BASELINE"
+EXPERIMENT_MODE = "COT"
+EXPERIMENT_MODE = "RAG"
+EXPERIMENT_MODE = "RAG_COT"
+EXPERIMENT_MODE = "RAG_BM25"
+EXPERIMENT_MODE = "RAG_BM25_CE"
+EXPERIMENT_MODE = "RAG_GOLDEN"
+EXPERIMENT_MODE = "RAG_COT_GOLDEN"
+```
+
+推荐参数：
+
+```python
+SAMPLE_SIZE = 50
+NUM_ROUNDS = 1
+RANDOM_SEED = 42
+REQUEST_DELAY = 1.0
+TEMPERATURE = 0.1
+```
+
+---
+
+### 8.3 HoVer 扩展实验
+
+单跳检索：
+
+```python
+EXPERIMENT_MODE = "EXTENDED_PIPELINE"
+USE_MULTI_HOP = False
+USE_LLM_JUDGE = False
+```
+
+IRCoT 多跳：
+
+```python
+EXPERIMENT_MODE = "EXTENDED_PIPELINE"
+USE_MULTI_HOP = True
+MAX_HOP_ROUNDS = 3
+USE_LLM_JUDGE = False
+```
+
+IRCoT + Judge：
+
+```python
+EXPERIMENT_MODE = "EXTENDED_PIPELINE"
+USE_MULTI_HOP = True
+MAX_HOP_ROUNDS = 3
+USE_LLM_JUDGE = True
+```
+
+---
+
+## 9. 输出文件
+
+实验结果保存在：
+
+```text
+data/results/
+```
+
+日志保存在：
+
+```text
+logs/
+```
+
+输出文件名示例：
+
+```text
+verification_results_rag_bm25_20260101_120000.json
+verification_rag_bm25_20260101_120000.log
+```
+
+结果 JSON 主要包含：
 
 ```json
 {
-  "metrics": {
-    "accuracy": 0.82,
-    "macro_precision": 0.79,
-    "macro_recall": 0.78,
-    "macro_f1": 0.785,
-    "hallucination_rate": 0.15,
-    "per_class_metrics": {...},
-    "confusion_matrix": [...]
+  "experiment_mode": "RAG_BM25",
+  "timestamp": "...",
+  "num_rounds": 1,
+  "valid_rounds": 1,
+  "random_seed": 42,
+  "sample_size": 50,
+  "aggregated_metrics": {
+    "accuracy": {"mean": 0.0, "std": 0.0},
+    "macro_f1": {"mean": 0.0, "std": 0.0}
   },
-  "detailed_results": [
+  "rounds": [
     {
-      "id": 123,
-      "claim": "...",
-      "true_label": "SUPPORTS",
-      "predicted_label": "SUPPORTS",
-      "correct": true
-    },
-    ...
-  ],
-  "summary": {
-    "total_samples": 50,
-    "successful_predictions": 50,
-    "failed_predictions": 0
-  }
+      "round": 1,
+      "metrics": {},
+      "detailed_results": []
+    }
+  ]
 }
 ```
 
-**`data/results/parse_errors.json`** - 解析错误记录（如果有）：
+每条样本的详细结果包括：
 
-```json
-[
-  {
-    "timestamp": "2026-04-17T15:06:23.123456",
-    "claim_id": 12345,
-    "claim": "某个声明...",
-    "response": "模型的原始响应...",
-    "reason": "无法匹配任何标签"
-  }
-]
+* `id`
+* `claim`
+* `true_label`
+* `predicted_label`
+* `evidence`
+* `correct`
+* `llm_raw`
+* `trace`
+
+---
+
+## 10. 评估指标
+
+系统计算以下指标：
+
+| 指标                 | 说明     |
+| ------------------ | ------ |
+| Accuracy           | 整体准确率  |
+| Macro Precision    | 宏平均精确率 |
+| Macro Recall       | 宏平均召回率 |
+| Macro F1           | 宏平均 F1 |
+| Weighted Precision | 加权精确率  |
+| Weighted Recall    | 加权召回率  |
+| Weighted F1        | 加权 F1  |
+| Hallucination Rate | 幻觉率    |
+| Confusion Matrix   | 混淆矩阵   |
+
+幻觉率定义为：
+
+```text
+真实标签为 NOT ENOUGH INFO 的样本中，被模型预测为 SUPPORTS 或 REFUTES 的比例。
 ```
 
-## 项目结构
+---
 
-```
-fact_verification/
-├── .venv/                      # 虚拟环境（不提交）
-├── .git/                       # Git仓库
-├── src/                        # 源代码
-│   ├── __init__.py
-│   ├── config.py               # 配置管理
-│   ├── data_loader.py          # 数据加载（支持本地缓存）
-│   ├── api_client.py           # API调用（含重试机制）
-│   ├── prompt_builder.py       # Prompt构造（含错误记录）
-│   ├── verifier.py             # 验证逻辑
-│   ├── evaluator.py            # 评估指标计算
-│   └── utils.py                # 工具函数
-├── data/
-│   ├── fever_labelled_dev.json # FEVER数据集本地缓存（不提交）
-│   └── results/                # 结果输出（不提交）
-│       ├── verification_results.json
-│       └── parse_errors.json
-├── logs/
-│   └── verification.log        # 运行日志
-├── main.py                     # 主程序入口
-├── requirements.txt            # 依赖包
-├── .env                        # 环境变量（不提交）
-├── .env.example                # 环境变量模板
-├── .gitignore                  # Git忽略规则
-├── README.md                   # 项目文档
-└── METRICS.md                  # 评估指标详细说明
+## 11. 绘图建议
+
+实验完成后，可以从结果 JSON 中读取 `aggregated_metrics`，绘制以下图表：
+
+1. FEVER 各模式 Accuracy 对比。
+2. FEVER 各模式 Macro F1 对比。
+3. FEVER 各模式 Hallucination Rate 对比。
+4. HoVer 单跳、多跳、多跳+Judge 消融对比。
+
+推荐 FEVER 图表横轴：
+
+```text
+BASELINE
+COT
+RAG
+RAG_COT
+RAG_BM25
+RAG_BM25_CE
+RAG_GOLDEN
+RAG_COT_GOLDEN
 ```
 
-## 评估指标说明
+推荐 HoVer 图表横轴：
 
-详见 [METRICS.md](METRICS.md)
-
-- **Accuracy（准确率）** - 所有预测中正确的比例
-- **Precision（精确率）** - 预测为某类别中真正属于该类别的比例
-- **Recall（召回率）** - 真实为某类别中被正确预测的比例
-- **F1-Score** - Precision和Recall的调和平均
-- **Hallucination Rate（幻觉率）** - 真实为NOT ENOUGH INFO但预测为SUPPORTS/REFUTES的比例
-
-## 注意事项
-
-1. **API密钥安全** - 不要将`.env`文件提交到Git
-2. **速率限制** - 程序已添加请求延迟（0.5秒），避免触发API限制
-3. **数据缓存** - 首次运行会下载约40MB数据，保存到本地后续直接读取
-4. **随机种子** - 固定随机种子后，每次采样结果完全一致，保证可复现
-5. **任务说明** - 任务一不使用evidence，测试模型的内在知识
-6. **错误记录** - 无法解析的响应会自动记录，方便调整prompt
-
-## 任务对比
-
-| 特性       | 任务一（Baseline） | 任务二（RAG）    |
-| ---------- | ------------------ | ---------------- |
-| 输入       | 只有claim          | claim + evidence |
-| 目的       | 测试模型内在知识   | 测试检索增强效果 |
-| 预期准确率 | 较低               | 较高             |
-| 幻觉率     | 可能较高           | 应该降低         |
-
-## 常见问题
-
-### Q: 如何修改采样数量？
-
-编辑 `src/config.py`，修改 `SAMPLE_SIZE` 参数。
-
-### Q: 如何使用不同的模型？
-
-编辑 `src/config.py`，修改 `MODEL_NAME` 参数。
-
-### Q: 如何重新下载数据集？
-
-删除 `data/fever_labelled_dev.json` 文件，再次运行程序即可。
-
-### Q: API调用失败怎么办？
-
-检查：
-
-1. API密钥是否正确（查看`.env`文件）
-2. 网络连接是否正常
-3. 查看 `logs/verification.log` 了解详细错误
-
-### Q: 如何查看无法解析的响应？
-
-查看 `data/results/parse_errors.json` 文件，根据实际响应调整 `src/prompt_builder.py` 中的解析逻辑。
-
-### Q: 如何推送到GitHub？
-
-```bash
-git add .
-git commit -m "Initial commit"
-git remote add origin <your-repo-url>
-git push -u origin main
+```text
+Single Retrieval
+IRCoT
+IRCoT + Judge
 ```
 
-## 许可证
+---
 
-MIT License
+## 12. 常见问题
 
-## 致谢
+### 12.1 API Connection error
 
-- [FEVER数据集](https://fever.ai/)
-- [Hugging Face Datasets](https://huggingface.co/datasets/fever/fever)
-- [DeepSeek API](https://www.deepseek.com/)
-- [uv - 快速Python包管理器](https://github.com/astral-sh/uv)
+如果出现：
+
+```text
+API调用失败: Connection error.
+```
+
+建议修改：
+
+```python
+REQUEST_DELAY = 1.0
+TIMEOUT = 90
+RETRY_DELAY = 5
+MAX_RETRIES = 3
+```
+
+并先使用：
+
+```python
+SAMPLE_SIZE = 5
+```
+
+确认能跑通。
+
+---
+
+### 12.2 找不到 DeepSeek API Key
+
+检查 `.env` 文件中是否存在：
+
+```env
+DEEPSEEK_API_KEY=your_api_key_here
+```
+
+---
+
+### 12.3 找不到 Wikipedia dump
+
+确认目录：
+
+```text
+data/wiki-pages/
+```
+
+下存在：
+
+```text
+wiki-*.jsonl
+```
+
+---
+
+### 12.4 找不到 HoVer 数据
+
+确认文件存在：
+
+```text
+data/cache/hover_dev.json
+```
+
+---
+
+### 12.5 CrossEncoder 第一次运行很慢
+
+`RAG_BM25_CE` 第一次运行时可能需要下载或加载 CrossEncoder 模型。建议先用：
+
+```python
+SAMPLE_SIZE = 5
+```
+
+测试，确认模型加载成功后再正式运行。
+
+---
+
+## 13. 实验注意事项
+
+1. `RAG_BM25` 和 `RAG_BM25_CE` 使用的是 filtered BM25 索引，即候选页面来自标注 evidence pages，报告中需要说明这不是完全开放域检索。
+2. `RAG_GOLDEN` 和 `RAG_COT_GOLDEN` 是上限对照组，不应与普通 RAG 混淆。
+3. HoVer 是二分类任务，与 FEVER 三分类任务应分开分析。
+4. 多轮实验不要缓存最终 prediction，否则无法观察模型输出随机性。
+5. 如果网络不稳定，应降低样本量并增大请求间隔。
+6. Prompt 解析失败会保存到 `data/results/parse_errors.json`，可用于后续调试。
+
+---
+
+## 14. 项目总结
+
+本项目实现了一个从基础大模型事实判断到检索增强、多步推理、自动证据选择、CrossEncoder 精排、Gold Evidence 上限对照和 HoVer 多跳验证的完整事实验证实验系统。
+
+该系统能够支持课程作业中的核心要求，包括：
+
+* 至少 50 条数据测试
+* Baseline 实验
+* RAG 检索增强实验
+* CoT 推理实验
+* Accuracy、Precision、Recall、F1、幻觉率计算
+* 不同方法性能对比
+* HoVer 多跳扩展
+* BM25、Sentence-BERT、CrossEncoder 自动证据选择扩展
+
+项目结构清晰，实验模式可配置，结果可复现，便于继续扩展和撰写实验报告。

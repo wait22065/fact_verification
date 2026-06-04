@@ -76,7 +76,7 @@ def load_json(file_path):
         return json.load(f)
 
 
-def format_time(seconds):
+def format_time(seconds): # 格式化时间显示
     """
     格式化时间显示
 

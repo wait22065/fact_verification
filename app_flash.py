@@ -19,7 +19,7 @@ def verify():
     data = request.json
     claim = data.get('claim')
     # 从请求中获取参数，不再覆盖 config 的全局变量
-    mode = data.get('mode', 'RAG_COT')
+    mode = data.get('mode', 'RAG_COT')# RAG_COT, RAG, COT, BASELINE
     num_sentences = int(data.get('num_sentences', 3))
     top_k = int(data.get('top_k', 1))
     
