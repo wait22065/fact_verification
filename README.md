@@ -55,6 +55,8 @@ Label: NOT ENOUGH INFO
 
 本项目主要支持以下实验路线：
 
+**FEVER 实验路线：**
+
 ```text
 Baseline
 CoT
@@ -64,7 +66,16 @@ BM25 + Sentence-BERT
 BM25 + Sentence-BERT + CrossEncoder
 Gold Evidence
 Gold Evidence + CoT
-HoVer 多跳事实验证
+```
+
+**HoVer 扩展实验路线（EXTENDED_PIPELINE）：**
+
+```text
+单跳检索（USE_MULTI_HOP=False）
+IRCoT 多跳检索（USE_MULTI_HOP=True）
+IRCoT + Cross-Encoder 精排（USE_MULTI_HOP=True, USE_CROSS_ENCODER=True）  ← 当前最佳
+IRCoT + Cross-Encoder + LLM Judge 二次核验（USE_LLM_JUDGE=True）
+可选检索模式：BM25（推荐）/ Dense / Hybrid（通过 RETRIEVAL_MODE 切换）
 ```
 
 ---
@@ -467,24 +478,38 @@ REBUILD_GOLDEN_EVIDENCE_CACHE = False
 
 ### 6. HoVer / IRCoT 配置
 
+以下参数仅对 `EXPERIMENT_MODE = "EXTENDED_PIPELINE"` 生效。
+
 ```python
 HOVER_INDEX_DIR = os.path.join(DATA_CACHE_DIR, "hover_bm25_index")
 
-USE_MULTI_HOP = True
-MAX_HOP_ROUNDS = 3
-USE_LLM_JUDGE = False
-RETRIEVAL_MODE = "BM25"
+USE_MULTI_HOP = True       # 是否启用 IRCoT 多跳检索
+MAX_HOP_ROUNDS = 3         # 最大跳数上限
+USE_CROSS_ENCODER = True   # 是否在多跳检索后启用 Cross-Encoder 精排
+USE_LLM_JUDGE = False      # 是否启用 LLM Judge 二次核验（净负效果，建议保持 False）
+RETRIEVAL_MODE = "BM25"    # 第一阶段文档检索模式
 ```
 
 参数说明：
 
-| 参数                | 说明               |
-| ----------------- | ---------------- |
-| `HOVER_INDEX_DIR` | HoVer BM25 索引目录  |
-| `USE_MULTI_HOP`   | 是否启用 IRCoT 多跳检索  |
-| `MAX_HOP_ROUNDS`  | 最大检索跳数           |
-| `USE_LLM_JUDGE`   | 是否启用二次 Judge 复核  |
-| `RETRIEVAL_MODE`  | 检索模式，当前建议使用 BM25 |
+| 参数                | 说明                                              |
+| ----------------- | ------------------------------------------------ |
+| `HOVER_INDEX_DIR` | HoVer BM25 索引目录                                 |
+| `USE_MULTI_HOP`   | 是否启用 IRCoT 多跳检索；False 为单跳模式                   |
+| `MAX_HOP_ROUNDS`  | 最大检索跳数，推荐 3；LLM 判断证据充足时可提前退出                |
+| `USE_CROSS_ENCODER` | 是否在 SBERT 粗排后启用 Cross-Encoder 精排；HoVer 专用开关，推荐 True |
+| `USE_LLM_JUDGE`   | 是否在基础核验后增加一轮 LLM 二次审核；实验显示准确率下降 4%，建议 False |
+| `RETRIEVAL_MODE`  | 第一阶段文档检索模式，可选值见下表                             |
+
+**RETRIEVAL_MODE 可选值：**
+
+| 值          | 说明                                                        |
+| ---------- | ----------------------------------------------------------- |
+| `"BM25"`   | BM25 关键词匹配（推荐）；对命名实体查询精度高，与 IRCoT 搭配效果最佳  |
+| `"DENSE"`  | FAISS 稠密向量检索；理论上能处理词汇缺口，但对专有名词区分能力弱于 BM25   |
+| `"HYBRID"` | BM25 与 Dense 取并集后重排；实验中效果与 BM25 相当，噪声略多         |
+
+注意：`USE_CROSS_ENCODER` 在此处（HoVer 配置块）的赋值会覆盖上方 CrossEncoder 精排配置中的同名变量，两者共用同一开关。`EXTENDED_PIPELINE` 模式下，建议显式设为 `True` 以开启精排。
 
 ---
 
@@ -497,10 +522,21 @@ RETRIEVAL_MODE = "BM25"
 | `RAG`               | 抽取核心实体，检索 Wikipedia 词条前几句作为证据          |
 | `RAG_COT`           | 检索证据 + Chain-of-Thought 推理             |
 | `RAG_BM25`          | BM25 文档召回 + Sentence-BERT 句子排序         |
-| `RAG_BM25_CE`       | BM25 + Sentence-BERT + CrossEncoder 精排 |
+| `RAG_BM25_CE`       | BM25 + Sentence-BERT + CrossEncoder 精排（verifier.py 自动开启 CE） |
 | `RAG_GOLDEN`        | 使用 FEVER 人工标注 Gold Evidence            |
 | `RAG_COT_GOLDEN`    | Gold Evidence + Chain-of-Thought 推理    |
-| `EXTENDED_PIPELINE` | HoVer 多跳事实验证扩展                         |
+| `EXTENDED_PIPELINE` | HoVer 多跳事实验证扩展，行为由下列开关控制：             |
+
+`EXTENDED_PIPELINE` 子变体（通过 `config.py` 中的开关组合切换）：
+
+| 子变体                          | `USE_MULTI_HOP` | `USE_CROSS_ENCODER` | `USE_LLM_JUDGE` | `RETRIEVAL_MODE` |
+| ----------------------------- | --------------- | ------------------- | --------------- | ---------------- |
+| 单跳检索                         | `False`         | `False`             | `False`         | `"BM25"`         |
+| IRCoT 多跳                      | `True`          | `False`             | `False`         | `"BM25"`         |
+| IRCoT + CE 精排（当前最佳）          | `True`          | `True`              | `False`         | `"BM25"`         |
+| IRCoT + CE + LLM Judge 二次核验   | `True`          | `True`              | `True`          | `"BM25"`         |
+| IRCoT + CE（Dense 检索，供消融对比）   | `True`          | `True`              | `False`         | `"DENSE"`        |
+| IRCoT + CE（Hybrid 检索，供消融对比）  | `True`          | `True`              | `False`         | `"HYBRID"`       |
 
 ---
 
@@ -582,7 +618,9 @@ EXPERIMENT_MODE = "RAG_COT_GOLDEN"
 ```python
 EXPERIMENT_MODE = "EXTENDED_PIPELINE"
 USE_MULTI_HOP = False
+USE_CROSS_ENCODER = False
 USE_LLM_JUDGE = False
+RETRIEVAL_MODE = "BM25"
 ```
 
 IRCoT 多跳版本：
@@ -591,16 +629,39 @@ IRCoT 多跳版本：
 EXPERIMENT_MODE = "EXTENDED_PIPELINE"
 USE_MULTI_HOP = True
 MAX_HOP_ROUNDS = 3
+USE_CROSS_ENCODER = False
 USE_LLM_JUDGE = False
+RETRIEVAL_MODE = "BM25"
 ```
 
-IRCoT + Judge 版本：
+IRCoT + Cross-Encoder 精排版本（当前最佳，Accuracy 66%）：
 
 ```python
 EXPERIMENT_MODE = "EXTENDED_PIPELINE"
 USE_MULTI_HOP = True
 MAX_HOP_ROUNDS = 3
-USE_LLM_JUDGE = True
+USE_CROSS_ENCODER = True   # 在多跳结果上启用 CE 精排
+USE_LLM_JUDGE = False
+RETRIEVAL_MODE = "BM25"
+```
+
+IRCoT + CE + LLM Judge 二次核验版本（实验性，准确率低于不加 Judge，仅供消融）：
+
+```python
+EXPERIMENT_MODE = "EXTENDED_PIPELINE"
+USE_MULTI_HOP = True
+MAX_HOP_ROUNDS = 3
+USE_CROSS_ENCODER = True
+USE_LLM_JUDGE = True       # 额外增加一轮 LLM 审核；实验结果净负收益
+RETRIEVAL_MODE = "BM25"
+```
+
+检索模式消融（固定 IRCoT + CE，仅切换 RETRIEVAL_MODE）：
+
+```python
+RETRIEVAL_MODE = "BM25"    # 推荐，命名实体查询精度最高
+RETRIEVAL_MODE = "DENSE"   # FAISS 稠密检索，专有名词精度弱于 BM25
+RETRIEVAL_MODE = "HYBRID"  # 并集后重排，效果与 BM25 相当
 ```
 
 ---
@@ -711,7 +772,8 @@ HoVer 图表横轴建议：
 ```text
 Single Retrieval
 IRCoT
-IRCoT + Judge
+IRCoT + CE
+IRCoT + CE + Judge
 ```
 
 ---
